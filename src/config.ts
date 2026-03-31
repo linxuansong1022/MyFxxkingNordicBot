@@ -5,6 +5,17 @@ import path from 'node:path'
 export type MiniCodeSettings = {
   env?: Record<string, string | number>
   model?: string
+  maxOutputTokens?: number
+  mcpServers?: Record<string, McpServerConfig>
+}
+
+export type McpServerConfig = {
+  command: string
+  args?: string[]
+  env?: Record<string, string | number>
+  cwd?: string
+  enabled?: boolean
+  protocol?: 'auto' | 'content-length' | 'newline-json'
 }
 
 export type RuntimeConfig = {
@@ -12,14 +23,20 @@ export type RuntimeConfig = {
   baseUrl: string
   authToken?: string
   apiKey?: string
+  maxOutputTokens?: number
+  mcpServers: Record<string, McpServerConfig>
   sourceSummary: string
 }
+
+export type McpConfigScope = 'user' | 'project'
 
 export const MINI_CODE_DIR = path.join(os.homedir(), '.mini-code')
 export const MINI_CODE_SETTINGS_PATH = path.join(MINI_CODE_DIR, 'settings.json')
 export const MINI_CODE_HISTORY_PATH = path.join(MINI_CODE_DIR, 'history.json')
 export const MINI_CODE_PERMISSIONS_PATH = path.join(MINI_CODE_DIR, 'permissions.json')
+export const MINI_CODE_MCP_PATH = path.join(MINI_CODE_DIR, 'mcp.json')
 export const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json')
+export const PROJECT_MCP_PATH = path.join(process.cwd(), '.mcp.json')
 
 async function readSettingsFile(filePath: string): Promise<MiniCodeSettings> {
   try {
@@ -42,10 +59,87 @@ async function readSettingsFile(filePath: string): Promise<MiniCodeSettings> {
   }
 }
 
+export async function readMcpConfigFile(
+  filePath: string,
+): Promise<Record<string, McpServerConfig>> {
+  try {
+    const content = await readFile(filePath, 'utf8')
+    const parsed = JSON.parse(content) as unknown
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      !('mcpServers' in parsed) ||
+      typeof parsed.mcpServers !== 'object' ||
+      parsed.mcpServers === null
+    ) {
+      return {}
+    }
+
+    return parsed.mcpServers as Record<string, McpServerConfig>
+  } catch (error) {
+    const code =
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      typeof error.code === 'string'
+        ? error.code
+        : ''
+
+    if (code === 'ENOENT') {
+      return {}
+    }
+
+    throw error
+  }
+}
+
+export function getMcpConfigPath(
+  scope: McpConfigScope,
+  cwd = process.cwd(),
+): string {
+  return scope === 'project' ? path.join(cwd, '.mcp.json') : MINI_CODE_MCP_PATH
+}
+
+export async function loadScopedMcpServers(
+  scope: McpConfigScope,
+  cwd = process.cwd(),
+): Promise<Record<string, McpServerConfig>> {
+  return readMcpConfigFile(getMcpConfigPath(scope, cwd))
+}
+
+export async function saveScopedMcpServers(
+  scope: McpConfigScope,
+  servers: Record<string, McpServerConfig>,
+  cwd = process.cwd(),
+): Promise<void> {
+  const targetPath = getMcpConfigPath(scope, cwd)
+  await mkdir(path.dirname(targetPath), { recursive: true })
+  await writeFile(
+    targetPath,
+    `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
+    'utf8',
+  )
+}
+
 function mergeSettings(
   base: MiniCodeSettings,
   override: MiniCodeSettings,
 ): MiniCodeSettings {
+  const mergedMcpServers = {
+    ...(base.mcpServers ?? {}),
+  }
+
+  for (const [name, server] of Object.entries(override.mcpServers ?? {})) {
+    mergedMcpServers[name] = {
+      ...(mergedMcpServers[name] ?? {}),
+      ...server,
+      env: {
+        ...(mergedMcpServers[name]?.env ?? {}),
+        ...(server.env ?? {}),
+      },
+    }
+  }
+
   return {
     ...base,
     ...override,
@@ -53,13 +147,22 @@ function mergeSettings(
       ...(base.env ?? {}),
       ...(override.env ?? {}),
     },
+    mcpServers: mergedMcpServers,
   }
 }
 
 export async function loadEffectiveSettings(): Promise<MiniCodeSettings> {
   const claudeSettings = await readSettingsFile(CLAUDE_SETTINGS_PATH)
+  const globalMcpConfig = await readMcpConfigFile(MINI_CODE_MCP_PATH)
+  const projectMcpConfig = await readMcpConfigFile(PROJECT_MCP_PATH)
   const miniCodeSettings = await readSettingsFile(MINI_CODE_SETTINGS_PATH)
-  return mergeSettings(claudeSettings, miniCodeSettings)
+  return mergeSettings(
+    mergeSettings(
+      mergeSettings(claudeSettings, { mcpServers: globalMcpConfig }),
+      { mcpServers: projectMcpConfig },
+    ),
+    miniCodeSettings,
+  )
 }
 
 export async function saveMiniCodeSettings(
@@ -91,6 +194,16 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
     String(env.ANTHROPIC_BASE_URL ?? '').trim() || 'https://api.anthropic.com'
   const authToken = String(env.ANTHROPIC_AUTH_TOKEN ?? '').trim() || undefined
   const apiKey = String(env.ANTHROPIC_API_KEY ?? '').trim() || undefined
+  const rawMaxOutputTokens =
+    process.env.MINI_CODE_MAX_OUTPUT_TOKENS ??
+    effectiveSettings.maxOutputTokens ??
+    env.MINI_CODE_MAX_OUTPUT_TOKENS
+  const parsedMaxOutputTokens =
+    rawMaxOutputTokens === undefined ? NaN : Number(rawMaxOutputTokens)
+  const maxOutputTokens =
+    Number.isFinite(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
+      ? Math.floor(parsedMaxOutputTokens)
+      : undefined
 
   if (!model) {
     throw new Error(
@@ -109,6 +222,8 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
     baseUrl,
     authToken,
     apiKey,
+    maxOutputTokens,
+    mcpServers: effectiveSettings.mcpServers ?? {},
     sourceSummary: `config: ${MINI_CODE_SETTINGS_PATH} > ${CLAUDE_SETTINGS_PATH} > process.env`,
   }
 }

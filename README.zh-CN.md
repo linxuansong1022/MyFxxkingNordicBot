@@ -26,6 +26,7 @@ MiniCode 围绕一个实用的 terminal-first agent loop 构建：
 - [快速开始](#快速开始)
 - [命令](#命令)
 - [配置](#配置)
+- [Skills 与 MCP 用法](#skills-与-mcp-用法)
 - [项目结构](#项目结构)
 - [架构文档](#架构文档)
 - [开发说明](#开发说明)
@@ -47,6 +48,9 @@ MiniCode 围绕一个实用的 terminal-first agent loop 构建：
 - `model -> tool -> model` 闭环
 - 全屏终端交互界面
 - 输入历史、transcript 滚动和 slash 命令菜单
+- 支持通过 `SKILL.md` 发现本地 skills
+- 支持通过 stdio 动态加载 MCP tools
+- 支持通过通用 MCP helper tools 访问 resources 和 prompts
 
 ### 内置工具
 
@@ -58,6 +62,11 @@ MiniCode 围绕一个实用的 terminal-first agent loop 构建：
 - `patch_file`
 - `modify_file`
 - `run_command`
+- `load_skill`
+- `list_mcp_resources`
+- `read_mcp_resource`
+- `list_mcp_prompts`
+- `get_mcp_prompt`
 
 ### 安全性与可用性
 
@@ -92,6 +101,7 @@ npm run install-local
 配置保存在：
 
 - `~/.mini-code/settings.json`
+- `~/.mini-code/mcp.json`
 
 启动命令安装到：
 
@@ -125,10 +135,21 @@ MINI_CODE_MODEL_MODE=mock npm run dev
 
 ## 命令
 
+### 管理命令
+
+- `minicode mcp list`
+- `minicode mcp add <name> [--project] [--protocol <mode>] [--env KEY=VALUE ...] -- <command> [args...]`
+- `minicode mcp remove <name> [--project]`
+- `minicode skills list`
+- `minicode skills add <path> [--name <name>] [--project]`
+- `minicode skills remove <name> [--project]`
+
 ### 本地 slash 命令
 
 - `/help`
 - `/tools`
+- `/skills`
+- `/mcp`
 - `/status`
 - `/model`
 - `/model <name>`
@@ -149,6 +170,12 @@ MINI_CODE_MODEL_MODE=mock npm run dev
 ```json
 {
   "model": "your-model-name",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  },
   "env": {
     "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
     "ANTHROPIC_AUTH_TOKEN": "your-token",
@@ -157,17 +184,186 @@ MINI_CODE_MODEL_MODE=mock npm run dev
 }
 ```
 
+也支持 Claude Code 风格的项目级 `.mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  }
+}
+```
+
+为了兼容不同厂商的 MCP 实现，MiniCode 现在会自动协商 stdio framing：
+
+- 默认先尝试标准 MCP 的 `Content-Length` framing
+- 如果失败，再自动回退到按行分隔的 JSON
+- 也可以在单个 server 上通过 `"protocol": "content-length"` 或 `"protocol": "newline-json"` 强制指定
+
+Skills 默认会从这些位置发现：
+
+- `./.mini-code/skills/<skill-name>/SKILL.md`
+- `~/.mini-code/skills/<skill-name>/SKILL.md`
+- `./.claude/skills/<skill-name>/SKILL.md`
+- `~/.claude/skills/<skill-name>/SKILL.md`
+
 配置优先级：
 
 1. `~/.mini-code/settings.json`
-2. 兼容的本地已有配置
-3. 当前进程环境变量
+2. `~/.mini-code/mcp.json`
+3. 项目级 `.mcp.json`
+4. 兼容的本地已有配置
+5. 当前进程环境变量
+
+## Skills 与 MCP 用法
+
+MiniCode 现在支持两类扩展：
+
+- `skills`：本地工作流说明，一般由一个 `SKILL.md` 描述如何完成某类任务
+- `MCP`：外部工具源，启动后会把远端 server 暴露的 tools / resources / prompts 接入 MiniCode
+
+### Skills：安装、查看、触发
+
+安装一个本地 skill：
+
+```bash
+minicode skills add ~/minimax-skills/skills/frontend-dev --name frontend-dev
+```
+
+查看已发现的 skills：
+
+```bash
+minicode skills list
+```
+
+进入交互界面后，也可以用：
+
+```text
+/skills
+```
+
+来检查当前会话里可用的 skills。
+
+如果你明确提到 skill 名，MiniCode 会优先加载它。比如：
+
+```text
+请使用 frontend-dev skill，直接重构当前 landing page，不要只停在方案说明。
+```
+
+也可以更明确地要求先读 skill：
+
+```text
+先加载 fullstack-dev skill，再根据这个 skill 的工作流实现当前需求。
+```
+
+一个常见用法是把官方或兼容 Claude Code 的 skills 仓库 clone 到本地后再安装：
+
+```bash
+git clone https://github.com/MiniMax-AI/skills.git ~/minimax-skills
+minicode skills add ~/minimax-skills/skills/frontend-dev --name frontend-dev
+```
+
+### MCP：安装、查看、触发
+
+安装一个用户级 MCP server：
+
+```bash
+minicode mcp add MiniMax --env MINIMAX_API_KEY=your-key --env MINIMAX_API_HOST=https://api.minimaxi.com -- uvx minimax-coding-plan-mcp -y
+```
+
+查看当前已配置的 MCP：
+
+```bash
+minicode mcp list
+```
+
+如果你想只给当前项目配置 MCP，可以加 `--project`：
+
+```bash
+minicode mcp add filesystem --project -- npx -y @modelcontextprotocol/server-filesystem .
+minicode mcp list --project
+```
+
+进入交互界面后，可以用：
+
+```text
+/mcp
+```
+
+查看当前会话里哪些 server 已连接、用了什么协议、暴露了多少 tools / resources / prompts。
+
+MCP tools 会自动注册成：
+
+```text
+mcp__<server_name>__<tool_name>
+```
+
+例如安装 MiniMax MCP 后，你可能会看到：
+
+- `mcp__minimax__web_search`
+- `mcp__minimax__understand_image`
+
+这些工具不需要手动声明，server 连接成功后会自动出现在工具列表中。
+
+### 在对话里怎么用
+
+最简单的方式是直接自然语言描述需求，让模型自己决定是否调用 skill 或 MCP tool：
+
+```text
+搜索一下最近关于 MCP 的中文资料，给我 5 条有代表性的链接。
+```
+
+如果当前已连接 MiniMax MCP，模型通常会自动选择 `mcp__minimax__web_search`。
+
+如果你想更稳一些，可以把 skill 或目标写清楚：
+
+```text
+请使用 frontend-dev skill，直接修改当前项目文件，把页面重做成更完整的产品落地页。
+```
+
+或者：
+
+```text
+请使用已连接的 MCP 工具帮我搜索 MiniMax MCP guide，并总结它提供了哪些能力。
+```
+
+### 什么时候用 skills，什么时候用 MCP
+
+- `skills` 更适合沉淀工作流、规范、领域经验
+- `MCP` 更适合接入搜索、图片理解、外部系统、数据库、浏览器、文件系统等远端能力
+
+一个常见组合是：
+
+- 用 `frontend-dev` 这类 skill 约束页面改造方式
+- 再让已连接的 MCP 提供搜索、图片理解或其他外部能力
+
+### 兼容性说明
+
+MiniCode 当前主要支持：
+
+- 本地 `SKILL.md` 发现与 `load_skill`
+- stdio MCP server
+- MCP tools
+- MCP resources / prompts 的通用 helper tools
+
+为了兼容不同厂商实现，MiniCode 会自动尝试：
+
+- 标准 `Content-Length` framing
+- 失败后回退到 `newline-json`
+
+所以像 MiniMax 这类采用按行 JSON 的 MCP server，也可以直接接入。
 
 ## 项目结构
 
 - `src/index.ts`: CLI 入口
 - `src/agent-loop.ts`: 多步模型/工具循环
 - `src/tool.ts`: 工具注册与执行
+- `src/skills.ts`: 本地 skill 发现与加载
+- `src/mcp.ts`: stdio MCP 客户端与动态工具封装
+- `src/manage-cli.ts`: 顶层 `minicode mcp` / `minicode skills` 管理命令
 - `src/tools/*`: 内置工具集合
 - `src/tui/*`: 终端 UI 模块
 - `src/config.ts`: 运行时配置加载

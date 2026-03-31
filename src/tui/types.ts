@@ -11,6 +11,11 @@ export type TranscriptEntry =
     }
   | {
       id: number
+      kind: 'progress'
+      body: string
+    }
+  | {
+      id: number
       kind: 'tool'
       toolName: string
       status: 'running' | 'success' | 'error'

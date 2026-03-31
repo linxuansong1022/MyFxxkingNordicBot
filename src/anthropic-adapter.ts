@@ -1,19 +1,82 @@
 import type { ToolRegistry } from './tool.js'
-import type { ChatMessage, ModelAdapter, ToolCall } from './types.js'
+import type { ChatMessage, ModelAdapter, StepDiagnostics, ToolCall } from './types.js'
 import type { RuntimeConfig } from './config.js'
 
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+  | { type: string; [key: string]: unknown }
 
 type AnthropicMessage = {
   role: 'user' | 'assistant'
   content: AnthropicContentBlock[]
 }
 
+function isTextBlock(block: AnthropicContentBlock): block is Extract<AnthropicContentBlock, {
+  type: 'text'
+}> {
+  return block.type === 'text' && typeof block.text === 'string'
+}
+
+function isToolUseBlock(block: AnthropicContentBlock): block is Extract<AnthropicContentBlock, {
+  type: 'tool_use'
+}> {
+  return (
+    block.type === 'tool_use' &&
+    typeof block.id === 'string' &&
+    typeof block.name === 'string'
+  )
+}
+
+function parseAssistantText(content: string): {
+  content: string
+  kind?: 'final' | 'progress'
+} {
+  const trimmed = content.trim()
+  if (!trimmed) {
+    return { content: '' }
+  }
+
+  const markers: Array<{
+    prefix: string
+    kind: 'final' | 'progress'
+  }> = [
+    { prefix: '<final>', kind: 'final' },
+    { prefix: '[FINAL]', kind: 'final' },
+    { prefix: '<progress>', kind: 'progress' },
+    { prefix: '[PROGRESS]', kind: 'progress' },
+  ]
+
+  for (const marker of markers) {
+    if (trimmed.startsWith(marker.prefix)) {
+      const rawContent = trimmed.slice(marker.prefix.length).trim()
+      const closingTag =
+        marker.kind === 'progress'
+          ? /<\/progress>/gi
+          : /<\/final>/gi
+      return {
+        content: rawContent.replace(closingTag, '').trim(),
+        kind: marker.kind,
+      }
+    }
+  }
+
+  return { content: trimmed }
+}
+
 function toTextBlock(text: string): AnthropicContentBlock {
   return { type: 'text', text }
+}
+
+function toAssistantText(message: Extract<ChatMessage, {
+  role: 'assistant' | 'assistant_progress'
+}>): string {
+  if (message.role === 'assistant_progress') {
+    return `<progress>\n${message.content}\n</progress>`
+  }
+
+  return message.content
 }
 
 function pushAnthropicMessage(
@@ -49,8 +112,12 @@ function toAnthropicMessages(messages: ChatMessage[]): {
       continue
     }
 
-    if (message.role === 'assistant') {
-      pushAnthropicMessage(converted, 'assistant', toTextBlock(message.content))
+    if (message.role === 'assistant' || message.role === 'assistant_progress') {
+      pushAnthropicMessage(
+        converted,
+        'assistant',
+        toTextBlock(toAssistantText(message)),
+      )
       continue
     }
 
@@ -97,28 +164,30 @@ export class AnthropicModelAdapter implements ModelAdapter {
       headers['x-api-key'] = runtime.apiKey
     }
 
+    const requestBody = {
+      model: runtime.model,
+      system: payload.system,
+      messages: payload.messages,
+      tools: this.tools.list().map(tool => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.inputSchema,
+      })),
+      ...(runtime.maxOutputTokens !== undefined
+        ? { max_tokens: runtime.maxOutputTokens }
+        : {}),
+    }
+
     const response = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        model: runtime.model,
-        max_tokens: 4096,
-        system: payload.system,
-        messages: payload.messages,
-        tools: this.tools.list().map(tool => ({
-          name: tool.name,
-          description: tool.description,
-          input_schema: tool.inputSchema,
-        })),
-      }),
+      body: JSON.stringify(requestBody),
     })
 
     const data = (await response.json()) as {
       error?: { message?: string }
-      content?: Array<
-        | { type: 'text'; text: string }
-        | { type: 'tool_use'; id: string; name: string; input: unknown }
-      >
+      stop_reason?: string
+      content?: AnthropicContentBlock[]
     }
 
     if (!response.ok) {
@@ -127,33 +196,54 @@ export class AnthropicModelAdapter implements ModelAdapter {
 
     const toolCalls: ToolCall[] = []
     const textParts: string[] = []
+    const blockTypes: string[] = []
+    const ignoredBlockTypes = new Set<string>()
 
     for (const block of data.content ?? []) {
-      if (block.type === 'text') {
+      blockTypes.push(block.type)
+
+      if (isTextBlock(block)) {
         textParts.push(block.text)
         continue
       }
 
-      if (block.type === 'tool_use') {
+      if (isToolUseBlock(block)) {
         toolCalls.push({
           id: block.id,
           toolName: block.name,
           input: block.input,
         })
+        continue
       }
+
+      ignoredBlockTypes.add(block.type)
+    }
+
+    const parsedText = parseAssistantText(textParts.join('\n').trim())
+    const diagnostics: StepDiagnostics = {
+      stopReason: data.stop_reason,
+      blockTypes,
+      ignoredBlockTypes: [...ignoredBlockTypes],
     }
 
     if (toolCalls.length > 0) {
       return {
         type: 'tool_calls' as const,
         calls: toolCalls,
-        content: textParts.join('\n').trim() || undefined,
+        content: parsedText.content || undefined,
+        contentKind:
+          parsedText.kind === 'progress'
+            ? ('progress' as const)
+            : undefined,
+        diagnostics,
       }
     }
 
     return {
       type: 'assistant' as const,
-      content: textParts.join('\n').trim() || '(empty response)',
+      content: parsedText.content,
+      kind: parsedText.kind,
+      diagnostics,
     }
   }
 }

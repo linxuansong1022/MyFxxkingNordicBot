@@ -48,6 +48,12 @@ function renderTranscriptEntry(entry: TranscriptEntry): string {
     )}`
   }
 
+  if (entry.kind === 'progress') {
+    return `${YELLOW}${BOLD}Progress${RESET}\n${indentBlock(
+      renderMarkdownish(entry.body),
+    )}`
+  }
+
   const status =
     entry.status === 'running'
       ? `${YELLOW}running${RESET}`

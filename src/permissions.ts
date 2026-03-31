@@ -117,7 +117,13 @@ function classifyDangerousCommand(command: string, args: string[]): string | nul
     return `npm publish affects a registry outside this machine (${signature})`
   }
 
-  if (command === 'node' || command === 'python3' || command === 'bun') {
+  if (
+    command === 'node' ||
+    command === 'python3' ||
+    command === 'bun' ||
+    command === 'bash' ||
+    command === 'sh'
+  ) {
     return `${command} can execute arbitrary local code (${signature})`
   }
 

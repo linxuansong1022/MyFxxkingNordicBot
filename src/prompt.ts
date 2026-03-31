@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import type { McpServerSummary } from './mcp.js'
+import type { SkillSummary } from './skills.js'
 
 async function maybeRead(filePath: string): Promise<string | null> {
   try {
@@ -13,6 +15,10 @@ async function maybeRead(filePath: string): Promise<string | null> {
 export async function buildSystemPrompt(
   cwd: string,
   permissionSummary: string[] = [],
+  extras?: {
+    skills?: SkillSummary[]
+    mcpServers?: McpServerSummary[]
+  },
 ): Promise<string> {
   const globalClaudeMd = await maybeRead(path.join(os.homedir(), '.claude', 'CLAUDE.md'))
   const projectClaudeMd = await maybeRead(path.join(cwd, 'CLAUDE.md'))
@@ -27,10 +33,55 @@ export async function buildSystemPrompt(
     'If the user clearly asked you to build, modify, optimize, or generate something, do the work instead of stopping at a plan.',
     'If a missing preference would materially change the result, ask one concise follow-up question and wait. Do not choose subjective preferences such as colors, visual style, copy tone, or naming unless the user explicitly told you to decide yourself.',
     'When using read_file, pay attention to the header fields. If it says TRUNCATED: yes, continue reading with a larger offset before concluding that the file itself is cut off.',
+    'If the user names a skill or clearly asks for a workflow that matches a listed skill, call load_skill before following it.',
+    'Structured response protocol:',
+    '- When you are still working and will continue with more tool calls, start your text with <progress>.',
+    '- Only when the task is actually complete and you are ready to hand control back, start your text with <final>.',
+    '- If you ask the user a clarifying question, ask it directly instead of using <final>.',
+    '- Do not stop after a progress update. After a <progress> message, continue the task in the next step.',
+    '- After you have used any tool in the current turn, any plain status update without <final> may be treated as progress and the agent may continue automatically.',
   ]
 
   if (permissionSummary.length > 0) {
     parts.push(`Permission context:\n${permissionSummary.join('\n')}`)
+  }
+
+  const skills = extras?.skills ?? []
+  if (skills.length > 0) {
+    parts.push(
+      `Available skills:\n${skills
+        .map(skill => `- ${skill.name}: ${skill.description}`)
+        .join('\n')}`,
+    )
+  } else {
+    parts.push('Available skills:\n- none discovered')
+  }
+
+  const mcpServers = extras?.mcpServers ?? []
+  if (mcpServers.length > 0) {
+    parts.push(
+      `Configured MCP servers:\n${mcpServers
+        .map(server => {
+          const suffix = server.error ? ` (${server.error})` : ''
+          const protocol = server.protocol ? `, protocol=${server.protocol}` : ''
+          const resources =
+            server.resourceCount !== undefined
+              ? `, resources=${server.resourceCount}`
+              : ''
+          const prompts =
+            server.promptCount !== undefined
+              ? `, prompts=${server.promptCount}`
+              : ''
+          return `- ${server.name}: ${server.status}, tools=${server.toolCount}${resources}${prompts}${protocol}${suffix}`
+        })
+        .join('\n')}`,
+    )
+    const connectedServers = mcpServers.filter(server => server.status === 'connected')
+    if (connectedServers.length > 0) {
+      parts.push(
+        'Connected MCP tools are already exposed in the tool list with names prefixed like mcp__server__tool. Use list_mcp_resources/read_mcp_resource and list_mcp_prompts/get_mcp_prompt when a server exposes those capabilities.',
+      )
+    }
   }
 
   if (globalClaudeMd) {

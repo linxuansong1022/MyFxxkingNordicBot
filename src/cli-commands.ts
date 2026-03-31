@@ -1,10 +1,12 @@
 import {
   CLAUDE_SETTINGS_PATH,
+  MINI_CODE_MCP_PATH,
   MINI_CODE_PERMISSIONS_PATH,
   MINI_CODE_SETTINGS_PATH,
   loadRuntimeConfig,
   saveMiniCodeSettings,
 } from './config.js'
+import type { ToolRegistry } from './tool.js'
 
 export type SlashCommand = {
   name: string
@@ -42,6 +44,16 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     name: '/config-paths',
     usage: '/config-paths',
     description: 'Show mini-code and Claude fallback settings paths.',
+  },
+  {
+    name: '/skills',
+    usage: '/skills',
+    description: 'List discovered SKILL.md workflows.',
+  },
+  {
+    name: '/mcp',
+    usage: '/mcp',
+    description: 'Show configured MCP servers and connection state.',
   },
   {
     name: '/permissions',
@@ -105,7 +117,12 @@ export function findMatchingSlashCommands(input: string): string[] {
     .filter(command => command.startsWith(input))
 }
 
-export async function tryHandleLocalCommand(input: string): Promise<string | null> {
+export async function tryHandleLocalCommand(
+  input: string,
+  context?: {
+    tools?: ToolRegistry
+  },
+): Promise<string | null> {
   if (input === '/') {
     return formatSlashCommands()
   }
@@ -118,12 +135,50 @@ export async function tryHandleLocalCommand(input: string): Promise<string | nul
     return [
       `mini-code settings: ${MINI_CODE_SETTINGS_PATH}`,
       `mini-code permissions: ${MINI_CODE_PERMISSIONS_PATH}`,
-      `claude fallback: ${CLAUDE_SETTINGS_PATH}`,
+      `mini-code mcp: ${MINI_CODE_MCP_PATH}`,
+      `compat fallback: ${CLAUDE_SETTINGS_PATH}`,
     ].join('\n')
   }
 
   if (input === '/permissions') {
     return `permission store: ${MINI_CODE_PERMISSIONS_PATH}`
+  }
+
+  if (input === '/skills') {
+    const skills = context?.tools?.getSkills() ?? []
+    if (skills.length === 0) {
+      return 'No skills discovered. Add skills under ~/.mini-code/skills/<name>/SKILL.md, .mini-code/skills/<name>/SKILL.md, .claude/skills/<name>/SKILL.md, or ~/.claude/skills/<name>/SKILL.md.'
+    }
+
+    return skills
+      .map(
+        skill =>
+          `${skill.name}  ${skill.description}  [${skill.source}]`,
+      )
+      .join('\n')
+  }
+
+  if (input === '/mcp') {
+    const servers = context?.tools?.getMcpServers() ?? []
+    if (servers.length === 0) {
+      return 'No MCP servers configured. Add mcpServers to ~/.mini-code/settings.json, ~/.mini-code/mcp.json, or project .mcp.json.'
+    }
+
+    return servers
+      .map(server => {
+        const suffix = server.error ? `  error=${server.error}` : ''
+        const protocol = server.protocol ? `  protocol=${server.protocol}` : ''
+        const resources =
+          server.resourceCount !== undefined
+            ? `  resources=${server.resourceCount}`
+            : ''
+        const prompts =
+          server.promptCount !== undefined
+            ? `  prompts=${server.promptCount}`
+            : ''
+        return `${server.name}  status=${server.status}  tools=${server.toolCount}${resources}${prompts}${protocol}${suffix}`
+      })
+      .join('\n')
   }
 
   if (input === '/status') {
@@ -132,6 +187,7 @@ export async function tryHandleLocalCommand(input: string): Promise<string | nul
       `model: ${runtime.model}`,
       `baseUrl: ${runtime.baseUrl}`,
       `auth: ${runtime.authToken ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY'}`,
+      `mcp servers: ${Object.keys(runtime.mcpServers).length}`,
       runtime.sourceSummary,
     ].join('\n')
   }

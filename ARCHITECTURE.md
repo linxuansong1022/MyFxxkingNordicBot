@@ -23,6 +23,7 @@ In other words, MiniCode is a smaller, more controllable terminal coding assista
 - Keep a unified tool contract and centralized registration
 - Keep a message-driven terminal interaction rhythm
 - Keep safety boundaries: path permissions, command permissions, and write approval
+- Keep Claude Code-inspired extension points: local skills and MCP-backed tools
 
 ## Planned / not yet built
 
@@ -42,8 +43,11 @@ In other words, MiniCode is a smaller, more controllable terminal coding assista
 - `src/index.ts`: CLI entry
 - `src/agent-loop.ts`: multi-turn tool-calling loop with a maximum step limit
 - `src/tool.ts`: registration, validation, execution
-- `src/tools/*`: `list_files` / `grep_files` / `read_file` / `write_file` / `edit_file` / `patch_file` / `modify_file` / `run_command`
+- `src/tools/*`: `list_files` / `grep_files` / `read_file` / `write_file` / `edit_file` / `patch_file` / `modify_file` / `run_command` / `load_skill`
 - `src/config.ts`: uses dedicated `~/.mini-code`
+- `src/skills.ts`: scans `.mini-code/skills` and compatible `.claude/skills` directories
+- `src/mcp.ts`: launches stdio MCP servers, negotiates framing compatibility, and wraps remote MCP tools into local tool definitions
+- `src/manage-cli.ts`: manages persisted MCP configs and installed local skills
 - `src/anthropic-adapter.ts`: Anthropic-compatible Messages API adapter
 - `src/mock-model.ts`: offline fallback adapter
 - `src/permissions.ts`: path, command, and edit approval with allowlist / denylist
@@ -59,6 +63,7 @@ That makes it well suited to:
 - Learning the basic pieces of a terminal coding agent
 - Studying tool-calling loops
 - Understanding permission approval and file review flows
+- Seeing how skills and external MCP tools can be added without a heavy plugin platform
 - Experimenting with how terminal UIs are organized
 - Customizing further on top of a small codebase
 
