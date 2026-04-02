@@ -87,6 +87,8 @@ MiniCode is a good fit if you want:
 - file review now uses standard unified diff output (closer to `git diff`)
 - approval view supports `Ctrl+O` expand/collapse plus wheel/page scrolling
 - finished tool calls auto-collapse into concise summaries to reduce transcript noise
+- explicit background shell commands launched through `run_command` are now surfaced as lightweight shell tasks instead of remaining stuck as a forever-running tool call
+- TTY input handling is serialized, and CRLF Enter sequences are normalized so approval confirms do not accidentally fire twice
 
 ## Installation
 

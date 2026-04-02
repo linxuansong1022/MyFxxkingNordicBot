@@ -8,9 +8,19 @@ export type ToolContext = {
   permissions?: PermissionManager
 }
 
+export type BackgroundTaskResult = {
+  taskId: string
+  type: 'local_bash'
+  command: string
+  pid: number
+  status: 'running' | 'completed' | 'failed'
+  startedAt: number
+}
+
 export type ToolResult = {
   ok: boolean
   output: string
+  backgroundTask?: BackgroundTaskResult
 }
 
 export type ToolDefinition<TInput> = {

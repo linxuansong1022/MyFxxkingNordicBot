@@ -1,6 +1,7 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { z } from 'zod'
+import { registerBackgroundShellTask } from '../background-tasks.js'
 import type { ToolDefinition } from '../tool.js'
 import { resolveToolPath } from '../workspace.js'
 
@@ -43,6 +44,19 @@ function looksLikeShellSnippet(command: string, args?: string[]): boolean {
   return /[|&;<>()$`]/.test(command)
 }
 
+function isBackgroundShellSnippet(command: string, args?: string[]): boolean {
+  if ((args?.length ?? 0) > 0) {
+    return false
+  }
+
+  const trimmed = command.trim()
+  return trimmed.endsWith('&') && !trimmed.endsWith('&&')
+}
+
+function stripTrailingBackgroundOperator(command: string): string {
+  return command.trim().replace(/&\s*$/, '').trim()
+}
+
 export const runCommandTool: ToolDefinition<Input> = {
   name: 'run_command',
   description:
@@ -70,6 +84,7 @@ export const runCommandTool: ToolDefinition<Input> = {
       : context.cwd
 
     const useShell = looksLikeShellSnippet(input.command, input.args)
+    const backgroundShell = isBackgroundShellSnippet(input.command, input.args)
 
     if (!useShell && !ALLOWLIST.has(input.command)) {
       return {
@@ -79,9 +94,33 @@ export const runCommandTool: ToolDefinition<Input> = {
     }
 
     const command = useShell ? 'bash' : input.command
-    const args = useShell ? ['-lc', input.command] : (input.args ?? [])
+    const args = useShell
+      ? ['-lc', backgroundShell ? stripTrailingBackgroundOperator(input.command) : input.command]
+      : (input.args ?? [])
 
     await context.permissions?.ensureCommand(command, args, effectiveCwd)
+
+    if (useShell && backgroundShell) {
+      const child = spawn(command, args, {
+        cwd: effectiveCwd,
+        env: process.env,
+        detached: true,
+        stdio: 'ignore',
+      })
+      child.unref()
+
+      const backgroundTask = registerBackgroundShellTask({
+        command: stripTrailingBackgroundOperator(input.command),
+        pid: child.pid ?? -1,
+        cwd: effectiveCwd,
+      })
+
+      return {
+        ok: true,
+        output: `Background command started.\nTASK: ${backgroundTask.taskId}\nPID: ${backgroundTask.pid}`,
+        backgroundTask,
+      }
+    }
 
     const result = await execFileAsync(command, args, {
       cwd: effectiveCwd,

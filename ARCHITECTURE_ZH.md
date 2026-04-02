@@ -49,6 +49,7 @@ MiniCode 优先保留这些能力：
 - `src/config.ts`: 使用独立的 `~/.mini-code`
 - `src/skills.ts`: 扫描 `.mini-code/skills` 和兼容的 `.claude/skills` 目录
 - `src/mcp.ts`: 启动 stdio MCP server，协商兼容的 framing，并把远端 MCP tools 封装成当前工具协议
+- `src/background-tasks.ts`: 给 `run_command` 和 TUI 使用的最小 background shell task 注册表
 - `src/manage-cli.ts`: 管理持久化 MCP 配置和本地安装的 skills
 - `src/anthropic-adapter.ts`: Anthropic 兼容 Messages API 适配器
 - `src/mock-model.ts`: 离线回退适配器
@@ -66,6 +67,7 @@ MiniCode 的一个优势，是用更轻量的实现方式，提供了类 Claude 
 - 研究 tool-calling loop
 - 理解权限审批和文件 review 流程
 - 理解如何在不引入重型插件平台的情况下接入 skills 和 MCP
+- 理解一种更接近 Claude Code 的“前台工具执行 / 后台 shell task”区分方式
 - 试验终端 UI 的组织方式
 - 在小代码量基础上继续做自己的定制开发
 

@@ -47,6 +47,7 @@ In other words, MiniCode is a smaller, more controllable terminal coding assista
 - `src/config.ts`: uses dedicated `~/.mini-code`
 - `src/skills.ts`: scans `.mini-code/skills` and compatible `.claude/skills` directories
 - `src/mcp.ts`: launches stdio MCP servers, negotiates framing compatibility, and wraps remote MCP tools into local tool definitions
+- `src/background-tasks.ts`: minimal background shell task registry used by `run_command` and the TUI
 - `src/manage-cli.ts`: manages persisted MCP configs and installed local skills
 - `src/anthropic-adapter.ts`: Anthropic-compatible Messages API adapter
 - `src/mock-model.ts`: offline fallback adapter
@@ -64,6 +65,7 @@ That makes it well suited to:
 - Studying tool-calling loops
 - Understanding permission approval and file review flows
 - Seeing how skills and external MCP tools can be added without a heavy plugin platform
+- Seeing a lightweight Claude Code-style distinction between foreground tool execution and background shell tasks
 - Experimenting with how terminal UIs are organized
 - Customizing further on top of a small codebase
 

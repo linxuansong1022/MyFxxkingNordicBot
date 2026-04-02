@@ -87,6 +87,8 @@ MiniCode 围绕一个实用的 terminal-first agent loop 构建：
 - diff 预览改为标准 unified diff（更接近 `git diff`）
 - 审批页面支持 `Ctrl+O` 展开/收起与滚轮/分页滚动
 - 工具调用结果自动折叠为摘要，减少 transcript 噪音
+- 通过 `run_command` 启动的显式后台 shell 命令，现在会以轻量 shell task 的形式呈现，不再卡成一个永远 running 的普通工具调用
+- TTY 输入事件现在串行处理，并且会把 CRLF 的 Enter 合并成一次确认，避免审批弹窗被重复触发
 
 ## 安装
 

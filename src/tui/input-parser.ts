@@ -211,7 +211,14 @@ export function parseInputChunk(
 
     if (char === '\r' || char === '\n') {
       events.push({ kind: 'key', name: 'return', ctrl: false, meta: false })
-      index += 1
+      if (
+        (char === '\r' && remaining[1] === '\n') ||
+        (char === '\n' && remaining[1] === '\r')
+      ) {
+        index += 2
+      } else {
+        index += 1
+      }
       continue
     }
 
