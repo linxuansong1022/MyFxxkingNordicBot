@@ -805,7 +805,7 @@
 
         <div class="feature-card span-8 fade-up delay-100">
           <h3 data-i18n="feat_4_title">Built-in Toolchain</h3>
-          <p data-i18n="feat_4_desc">Local file system management, command execution, and MCP helpers are centralized through a standardized tool protocol, ready to be called by the model at any time.</p>
+          <p data-i18n="feat_4_desc" data-html="true">Local file system management, command execution, and MCP helpers are centralized through a standardized tool protocol, ready to be called by the model at any time.</p>
           <div class="tools-flex">
             <span class="tool-tag">list_files</span>
             <span class="tool-tag">grep_files</span>
@@ -813,9 +813,13 @@
             <span class="tool-tag">write_file</span>
             <span class="tool-tag">edit_file</span>
             <span class="tool-tag">patch_file</span>
+            <span class="tool-tag">modify_file</span>
             <span class="tool-tag">run_command</span>
+            <span class="tool-tag">ask_user</span>
             <span class="tool-tag">load_skill</span>
             <span class="tool-tag">list_mcp_resources</span>
+            <span class="tool-tag">read_mcp_resource</span>
+            <span class="tool-tag">list_mcp_prompts</span>
             <span class="tool-tag">get_mcp_prompt</span>
           </div>
         </div>
@@ -956,11 +960,11 @@
         feat_2_desc: "Safety shouldn't be an afterthought. MiniCode brings permission validation and code review straight into the primary execution pathway.",
         feat_2_l1: "Standard Unified Diff view before writing",
         feat_2_l2: "Path and command allowlist verification",
-        feat_2_l3: "Interception of dangerous actions",
+        feat_2_l3: "Interception of dangerous actions with responsive approval controls",
         feat_3_title: "Skills & MCP",
         feat_3_desc: "Extend capabilities endlessly. MiniCode discovers local <code>SKILL.md</code> instructions and seamlessly mounts stdio Model Context Protocol (MCP) servers.",
         feat_4_title: "Built-in Toolchain",
-        feat_4_desc: "Local file system management, command execution, and MCP helpers are centralized through a standardized tool protocol, ready to be called by the model at any time.",
+        feat_4_desc: "Local file ops, command execution (including single-string calls like <code>git status</code>), structured user clarification via <code>ask_user</code>, and full MCP helpers are centralized through one standardized tool protocol.",
         arch_title: "Architecture",
         arch_desc: "MiniCode is not a bloated platform. It's a precisely structured codebase centered around the main execution loop.",
         arch_1_desc: "The core multi-turn tool-calling loop that drives the entire asynchronous conversational logic.",
@@ -1032,11 +1036,11 @@
         feat_2_desc: "安全不能只是附加项。MiniCode 巧妙地将权限验证和代码 Diff 审查置入了主执行链路内，而非外围补丁。",
         feat_2_l1: "写入代码前展示标准 Unified Diff 进行确认",
         feat_2_l2: "基于白名单规则的路径与命令审查",
-        feat_2_l3: "从框架底层有效拦截危险操作",
+        feat_2_l3: "从框架底层拦截危险操作，并保持审批交互稳定可控",
         feat_3_title: "Skills & MCP 无限扩展",
         feat_3_desc: "拥抱生态标准。MiniCode 可自动发现 <code>SKILL.md</code> 组织的工作流，并无缝挂载标准的 stdio MCP 服务器，无穷扩展能力边界。",
         feat_4_title: "内置底层工具链",
-        feat_4_desc: "本地文件系统、Shell 命令行执行以及 MCP 资源辅助，统统收口于标准化的工具调用协议，随时待命响应。",
+        feat_4_desc: "本地文件操作、Shell 命令执行（含 <code>git status</code> 这类单字符串命令）、通过 <code>ask_user</code> 的结构化澄清，以及完整 MCP helper，统一收口到标准化工具协议。",
         arch_title: "核心架构地图",
         arch_desc: "MiniCode 不是一个“大而全”的平台。它是一个高度克制、围绕主循环结构化裁剪的极简基座代码库。",
         arch_1_desc: "多步模型/工具循环引擎，驱动整个终端异步对话交互的心脏。",

@@ -89,13 +89,19 @@ MiniCode is a good fit if you want:
 ### Recent interaction upgrades
 
 - approval prompts now use Up/Down selection with Enter confirm
+- approval prompts also support direct letter/number shortcuts shown in each option
 - supports "reject with guidance" to send corrective instructions back to the model
 - edit approvals support "allow this file for this turn" and "allow all edits for this turn"
 - file review now uses standard unified diff output (closer to `git diff`)
 - approval view supports `Ctrl+O` expand/collapse plus wheel/page scrolling
+- `Ctrl+C` now exits cleanly even when an approval prompt is open
 - finished tool calls auto-collapse into concise summaries to reduce transcript noise
 - explicit background shell commands launched through `run_command` are now surfaced as lightweight shell tasks instead of remaining stuck as a forever-running tool call
 - TTY input handling is serialized, and CRLF Enter sequences are normalized so approval confirms do not accidentally fire twice
+- fixed an input-event deadlock where approval prompts could stop accepting Up/Down/Enter
+- escape-sequence parsing is hardened so malformed terminal input does not stall key handling
+- `run_command` now accepts single-string invocations like `"git status"` and auto-splits args
+- clarifying questions are now structured via `ask_user`, and the turn pauses until the user replies
 
 ## Installation
 
@@ -174,7 +180,7 @@ MINI_CODE_MODEL_MODE=mock npm run dev
 - transcript scrolling
 - prompt editing
 - input history navigation
-- approval selection and feedback input flow
+- approval selection and feedback input flow (Up/Down + Enter, or key shortcuts)
 
 ## Configuration
 
