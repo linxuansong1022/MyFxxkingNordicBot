@@ -190,10 +190,13 @@ function mergeSettings(
 }
 
 export async function loadEffectiveSettings(): Promise<MiniCodeSettings> {
-  const claudeSettings = await readSettingsFile(CLAUDE_SETTINGS_PATH)
-  const globalMcpConfig = await readMcpConfigFile(MINI_CODE_MCP_PATH)
-  const projectMcpConfig = await readMcpConfigFile(PROJECT_MCP_PATH)
-  const miniCodeSettings = await readSettingsFile(MINI_CODE_SETTINGS_PATH)
+  const [claudeSettings, globalMcpConfig, projectMcpConfig, miniCodeSettings] =
+    await Promise.all([
+      readSettingsFile(CLAUDE_SETTINGS_PATH),
+      readMcpConfigFile(MINI_CODE_MCP_PATH),
+      readMcpConfigFile(PROJECT_MCP_PATH),
+      readSettingsFile(MINI_CODE_SETTINGS_PATH),
+    ])
   return mergeSettings(
     mergeSettings(
       mergeSettings(claudeSettings, { mcpServers: globalMcpConfig }),

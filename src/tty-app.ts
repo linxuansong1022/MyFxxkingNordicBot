@@ -887,7 +887,12 @@ export async function runTtyApp(args: TtyAppArgs): Promise<void> {
     ),
   }
   await permissionArgs.permissions.whenReady()
-  await refreshSystemPrompt(permissionArgs)
+  if (
+    permissionArgs.messages.length === 0 ||
+    permissionArgs.messages[0]?.role !== 'system'
+  ) {
+    await refreshSystemPrompt(permissionArgs)
+  }
 
   renderScreen(permissionArgs, state)
 

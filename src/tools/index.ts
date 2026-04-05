@@ -19,11 +19,13 @@ export async function createDefaultToolRegistry(args: {
   cwd: string
   runtime: RuntimeConfig | null
 }): Promise<ToolRegistry> {
-  const skills = await discoverSkills(args.cwd)
-  const mcp = await createMcpBackedTools({
-    cwd: args.cwd,
-    mcpServers: args.runtime?.mcpServers ?? {},
-  })
+  const [skills, mcp] = await Promise.all([
+    discoverSkills(args.cwd),
+    createMcpBackedTools({
+      cwd: args.cwd,
+      mcpServers: args.runtime?.mcpServers ?? {},
+    }),
+  ])
 
   return new ToolRegistry([
     askUserTool,

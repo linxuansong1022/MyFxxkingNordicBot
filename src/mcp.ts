@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 import { readMcpTokensFile } from './config.js'
@@ -58,6 +60,14 @@ export type McpServerSummary = {
 
 type JsonRpcProtocol = 'content-length' | 'newline-json' | 'streamable-http'
 const MCP_INITIALIZE_TIMEOUT_MS = 10000
+const MCP_INITIALIZE_PROBE_TIMEOUT_MS = 1200
+const MCP_PROTOCOL_CACHE_PATH = path.join(
+  os.homedir(),
+  '.mini-code',
+  'mcp-protocol-cache.json',
+)
+
+type ProtocolCache = Record<string, JsonRpcProtocol>
 
 function formatChildProcessError(
   serverName: string,
@@ -94,6 +104,13 @@ function formatChildProcessError(
   }
 
   return new Error(lines.join('\n'))
+}
+
+function isInitializeTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes('request timed out for initialize')
+  )
 }
 
 function sanitizeToolSegment(value: string): string {
@@ -342,6 +359,34 @@ async function loadMcpToken(serverName: string): Promise<string | undefined> {
   return undefined
 }
 
+async function readProtocolCache(): Promise<ProtocolCache> {
+  try {
+    const content = await readFile(MCP_PROTOCOL_CACHE_PATH, 'utf8')
+    const parsed = JSON.parse(content) as unknown
+    if (typeof parsed !== 'object' || parsed === null) {
+      return {}
+    }
+    const cache: ProtocolCache = {}
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (
+        value === 'content-length' ||
+        value === 'newline-json' ||
+        value === 'streamable-http'
+      ) {
+        cache[key] = value
+      }
+    }
+    return cache
+  } catch {
+    return {}
+  }
+}
+
+async function writeProtocolCache(cache: ProtocolCache): Promise<void> {
+  await mkdir(path.dirname(MCP_PROTOCOL_CACHE_PATH), { recursive: true })
+  await writeFile(MCP_PROTOCOL_CACHE_PATH, `${JSON.stringify(cache, null, 2)}\n`, 'utf8')
+}
+
 class StdioMcpClient {
   private process: ChildProcessWithoutNullStreams | null = null
   private nextId = 1
@@ -355,6 +400,7 @@ class StdioMcpClient {
     private readonly serverName: string,
     private readonly config: McpServerConfig,
     private readonly cwd: string,
+    private readonly preferredProtocol?: JsonRpcProtocol,
   ) {}
 
   async start(): Promise<void> {
@@ -363,27 +409,38 @@ class StdioMcpClient {
     }
 
     const protocols = this.getProtocolCandidates()
+    const autoProtocol =
+      this.config.protocol === undefined || this.config.protocol === 'auto'
     let lastError: Error | null = null
 
-    for (const protocol of protocols) {
+    for (let index = 0; index < protocols.length; index += 1) {
+      const protocol = protocols[index]!
+      const useProbeTimeout =
+        autoProtocol && !this.preferredProtocol && index === 0
+      const timeoutMs =
+        useProbeTimeout
+          ? MCP_INITIALIZE_PROBE_TIMEOUT_MS
+          : MCP_INITIALIZE_TIMEOUT_MS
       try {
-        await this.spawnProcess()
-        this.protocol = protocol
-        await this.request(
-          'initialize',
-          {
-            protocolVersion: '2024-11-05',
-            capabilities: {},
-            clientInfo: {
-              name: 'mini-code',
-              version: '0.1.0',
-            },
-          },
-          MCP_INITIALIZE_TIMEOUT_MS,
-        )
-        this.notify('notifications/initialized', {})
+        await this.initializeWithProtocol(protocol, timeoutMs)
         return
       } catch (error) {
+        // Fast probe can be too short on cold starts: retry the same protocol once
+        // with full timeout before falling back to another framing format.
+        if (useProbeTimeout && isInitializeTimeoutError(error)) {
+          await this.close()
+          try {
+            await this.initializeWithProtocol(protocol, MCP_INITIALIZE_TIMEOUT_MS)
+            return
+          } catch (retryError) {
+            lastError =
+              retryError instanceof Error
+                ? retryError
+                : new Error(String(retryError))
+            await this.close()
+            continue
+          }
+        }
         lastError = error instanceof Error ? error : new Error(String(error))
         await this.close()
       }
@@ -400,12 +457,36 @@ class StdioMcpClient {
     return this.serverName
   }
 
+  private async initializeWithProtocol(
+    protocol: JsonRpcProtocol,
+    timeoutMs: number,
+  ): Promise<void> {
+    await this.spawnProcess()
+    this.protocol = protocol
+    await this.request(
+      'initialize',
+      {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: {
+          name: 'mini-code',
+          version: '0.1.0',
+        },
+      },
+      timeoutMs,
+    )
+    this.notify('notifications/initialized', {})
+  }
+
   private getProtocolCandidates(): JsonRpcProtocol[] {
     if (this.config.protocol === 'content-length') {
       return ['content-length']
     }
     if (this.config.protocol === 'newline-json') {
       return ['newline-json']
+    }
+    if (this.preferredProtocol === 'newline-json') {
+      return ['newline-json', 'content-length']
     }
     return ['content-length', 'newline-json']
   }
@@ -905,13 +986,15 @@ export async function createMcpBackedTools(args: {
   servers: McpServerSummary[]
   dispose: () => Promise<void>
 }> {
+  const protocolCache = await readProtocolCache()
+  let protocolCacheDirty = false
   const clients: McpClientLike[] = []
+  const clientsByServer = new Map<string, McpClientLike>()
   const tools: ToolDefinition<unknown>[] = []
   const servers: McpServerSummary[] = []
-  const resourceIndex = new Map<string, { serverName: string; resource: McpResourceDescriptor }>()
-  const promptIndex = new Map<string, { serverName: string; prompt: McpPromptDescriptor }>()
 
   for (const [serverName, config] of Object.entries(args.mcpServers)) {
+    const endpointKey = `${serverName}::${summarizeServerEndpoint(config)}`
     if (config.enabled === false) {
       servers.push({
         name: serverName,
@@ -942,27 +1025,26 @@ export async function createMcpBackedTools(args: {
     const client: McpClientLike =
       selectedProtocol === 'streamable-http'
         ? new StreamableHttpMcpClient(serverName, config)
-        : new StdioMcpClient(serverName, config, args.cwd)
+        : new StdioMcpClient(
+            serverName,
+            config,
+            args.cwd,
+            protocolCache[endpointKey],
+          )
 
     try {
       await client.start()
       const descriptors = await client.listTools()
-      const resources = await client.listResources().catch(() => [])
-      const prompts = await client.listPrompts().catch(() => [])
       clients.push(client)
-
-      for (const resource of resources) {
-        resourceIndex.set(`${serverName}:${resource.uri}`, {
-          serverName,
-          resource,
-        })
-      }
-
-      for (const prompt of prompts) {
-        promptIndex.set(`${serverName}:${prompt.name}`, {
-          serverName,
-          prompt,
-        })
+      clientsByServer.set(serverName, client)
+      const negotiated = client.getProtocol()
+      if (
+        negotiated &&
+        negotiated !== 'streamable-http' &&
+        protocolCache[endpointKey] !== negotiated
+      ) {
+        protocolCache[endpointKey] = negotiated
+        protocolCacheDirty = true
       }
 
       for (const descriptor of descriptors) {
@@ -989,8 +1071,6 @@ export async function createMcpBackedTools(args: {
         status: 'connected',
         toolCount: descriptors.length,
         protocol: client.getProtocol() ?? undefined,
-        resourceCount: resources.length,
-        promptCount: prompts.length,
       })
     } catch (error) {
       await client.close()
@@ -1008,7 +1088,13 @@ export async function createMcpBackedTools(args: {
     }
   }
 
-  if (resourceIndex.size > 0) {
+  if (protocolCacheDirty) {
+    await writeProtocolCache(protocolCache).catch(() => {
+      // Ignore protocol cache persistence failures.
+    })
+  }
+
+  if (clientsByServer.size > 0) {
     tools.push({
       name: 'list_mcp_resources',
       description: 'List available MCP resources exposed by connected MCP servers.',
@@ -1022,12 +1108,26 @@ export async function createMcpBackedTools(args: {
         server: z.string().optional(),
       }),
       async run(input: { server?: string }) {
-        const lines = [...resourceIndex.values()]
-          .filter(entry => !input.server || entry.serverName === input.server)
-          .map(
-            entry =>
-              `${entry.serverName}: ${entry.resource.uri}${entry.resource.name ? ` (${entry.resource.name})` : ''}${entry.resource.description ? ` - ${entry.resource.description}` : ''}`,
-          )
+        const targetClients = input.server
+          ? [clientsByServer.get(input.server)].filter(
+              (client): client is McpClientLike => client !== undefined,
+            )
+          : [...clientsByServer.values()]
+        const lines: string[] = []
+        for (const client of targetClients) {
+          try {
+            const resources = await client.listResources()
+            for (const resource of resources) {
+              lines.push(
+                `${client.getServerName()}: ${resource.uri}${resource.name ? ` (${resource.name})` : ''}${resource.description ? ` - ${resource.description}` : ''}`,
+              )
+            }
+          } catch (error) {
+            lines.push(
+              `${client.getServerName()}: failed to list resources (${error instanceof Error ? error.message : String(error)})`,
+            )
+          }
+        }
         return {
           ok: true,
           output: lines.length > 0 ? lines.join('\n') : 'No MCP resources available.',
@@ -1051,7 +1151,7 @@ export async function createMcpBackedTools(args: {
         uri: z.string().min(1),
       }),
       async run(input: { server: string; uri: string }) {
-        const client = clients.find(item => item.getServerName() === input.server)
+        const client = clientsByServer.get(input.server)
         if (!client) {
           return {
             ok: false,
@@ -1061,9 +1161,6 @@ export async function createMcpBackedTools(args: {
         return client.readResource(input.uri)
       },
     } satisfies ToolDefinition<{ server: string; uri: string }>)
-  }
-
-  if (promptIndex.size > 0) {
     tools.push({
       name: 'list_mcp_prompts',
       description: 'List available MCP prompts exposed by connected MCP servers.',
@@ -1077,14 +1174,29 @@ export async function createMcpBackedTools(args: {
         server: z.string().optional(),
       }),
       async run(input: { server?: string }) {
-        const lines = [...promptIndex.values()]
-          .filter(entry => !input.server || entry.serverName === input.server)
-          .map(entry => {
-            const argsSummary = (entry.prompt.arguments ?? [])
-              .map(arg => `${arg.name}${arg.required ? '*' : ''}`)
-              .join(', ')
-            return `${entry.serverName}: ${entry.prompt.name}${argsSummary ? ` args=[${argsSummary}]` : ''}${entry.prompt.description ? ` - ${entry.prompt.description}` : ''}`
-          })
+        const targetClients = input.server
+          ? [clientsByServer.get(input.server)].filter(
+              (client): client is McpClientLike => client !== undefined,
+            )
+          : [...clientsByServer.values()]
+        const lines: string[] = []
+        for (const client of targetClients) {
+          try {
+            const prompts = await client.listPrompts()
+            for (const prompt of prompts) {
+              const argsSummary = (prompt.arguments ?? [])
+                .map(arg => `${arg.name}${arg.required ? '*' : ''}`)
+                .join(', ')
+              lines.push(
+                `${client.getServerName()}: ${prompt.name}${argsSummary ? ` args=[${argsSummary}]` : ''}${prompt.description ? ` - ${prompt.description}` : ''}`,
+              )
+            }
+          } catch (error) {
+            lines.push(
+              `${client.getServerName()}: failed to list prompts (${error instanceof Error ? error.message : String(error)})`,
+            )
+          }
+        }
         return {
           ok: true,
           output: lines.length > 0 ? lines.join('\n') : 'No MCP prompts available.',
@@ -1117,7 +1229,7 @@ export async function createMcpBackedTools(args: {
         name: string
         arguments?: Record<string, string>
       }) {
-        const client = clients.find(item => item.getServerName() === input.server)
+        const client = clientsByServer.get(input.server)
         if (!client) {
           return {
             ok: false,
