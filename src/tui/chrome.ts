@@ -278,9 +278,9 @@ export function renderBanner(
   const metaLine = joinSegmentsWithinWidth(metaBadges, '  ', panelInner)
 
   return renderPanel(
-    'MiniCode',
+    'MyFxxkingNordicBot',
     [
-      `${DIM}Terminal coding assistant with a card-style session layout.${RESET}`,
+      `${DIM}Terminal coding assistant powered by Gemini.${RESET}`,
       '',
       projectLine,
       metaLine,

@@ -209,10 +209,40 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
     effectiveSettings.model ||
     String(env.ANTHROPIC_MODEL ?? '').trim()
 
-  const baseUrl =
-    String(env.ANTHROPIC_BASE_URL ?? '').trim() || 'https://api.anthropic.com'
+  const lowerModel = model.toLowerCase()
+
+  // --- Resolve base URL by provider ---
+  const explicitBaseUrl = String(env.ANTHROPIC_BASE_URL ?? '').trim()
+  let defaultBaseUrl: string
+
+  if (lowerModel.startsWith('gemini')) {
+    defaultBaseUrl = String(env.GEMINI_BASE_URL ?? '').trim() || 'https://generativelanguage.googleapis.com'
+  } else if (lowerModel.startsWith('deepseek')) {
+    defaultBaseUrl = String(env.DEEPSEEK_BASE_URL ?? '').trim() || 'https://api.deepseek.com'
+  } else if (lowerModel.startsWith('qwen')) {
+    defaultBaseUrl = String(env.QWEN_BASE_URL ?? '').trim() || 'https://dashscope.aliyuncs.com/compatible-mode'
+  } else if (lowerModel.startsWith('gpt') || lowerModel.startsWith('o1') || lowerModel.startsWith('o3') || lowerModel.startsWith('o4') || lowerModel.startsWith('chatgpt')) {
+    defaultBaseUrl = String(env.OPENAI_BASE_URL ?? '').trim() || 'https://api.openai.com'
+  } else if (lowerModel.startsWith('claude')) {
+    defaultBaseUrl = 'https://api.anthropic.com'
+  } else {
+    // Unknown model — if OPENAI_BASE_URL is set, use it (likely Ollama/local)
+    defaultBaseUrl = String(env.OPENAI_BASE_URL ?? '').trim() || 'https://api.openai.com'
+  }
+
+  const baseUrl = explicitBaseUrl || defaultBaseUrl
+
+  // --- Resolve auth ---
   const authToken = String(env.ANTHROPIC_AUTH_TOKEN ?? '').trim() || undefined
-  const apiKey = String(env.ANTHROPIC_API_KEY ?? '').trim() || undefined
+
+  // Try all known API key env vars in priority order based on model
+  const apiKey =
+    String(env.ANTHROPIC_API_KEY ?? '').trim() ||
+    String(env.GEMINI_API_KEY ?? '').trim() ||
+    String(env.OPENAI_API_KEY ?? '').trim() ||
+    String(env.DEEPSEEK_API_KEY ?? '').trim() ||
+    undefined
+
   const rawMaxOutputTokens =
     process.env.MINI_CODE_MAX_OUTPUT_TOKENS ??
     effectiveSettings.maxOutputTokens ??
@@ -226,13 +256,17 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
 
   if (!model) {
     throw new Error(
-      `No model configured. Set ~/.mini-code/settings.json or env.ANTHROPIC_MODEL.`,
+      `No model configured. Set "model" in ~/.mini-code/settings.json.`,
     )
   }
 
   if (!authToken && !apiKey) {
     throw new Error(
-      `No auth configured. Set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY in ~/.mini-code/settings.json or process env.`,
+      `No API key configured. Set the matching key in ~/.mini-code/settings.json under "env".\n` +
+      `  Gemini  → GEMINI_API_KEY\n` +
+      `  Claude  → ANTHROPIC_API_KEY\n` +
+      `  OpenAI  → OPENAI_API_KEY\n` +
+      `  DeepSeek→ DEEPSEEK_API_KEY`,
     )
   }
 

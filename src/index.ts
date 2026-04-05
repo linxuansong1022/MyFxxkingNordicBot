@@ -1,6 +1,5 @@
 import readline from 'node:readline'
 import process from 'node:process'
-import { AnthropicModelAdapter } from './anthropic-adapter.js'
 import {
   completeSlashCommand,
   findMatchingSlashCommands,
@@ -9,7 +8,7 @@ import {
 import { loadRuntimeConfig } from './config.js'
 import { maybeHandleManagementCommand } from './manage-cli.js'
 import { summarizeMcpServers } from './mcp-status.js'
-import { MockModelAdapter } from './mock-model.js'
+import { createModelAdapter } from './model-factory.js'
 import { PermissionManager } from './permissions.js'
 import { buildSystemPrompt } from './prompt.js'
 import { createDefaultToolRegistry, hydrateMcpTools } from './tools/index.js'
@@ -46,10 +45,7 @@ async function main(): Promise<void> {
   })
   const permissions = new PermissionManager(cwd)
   await permissions.whenReady()
-  const model =
-    process.env.MINI_CODE_MODEL_MODE === 'mock'
-      ? new MockModelAdapter()
-      : new AnthropicModelAdapter(tools, loadRuntimeConfig)
+  const model = createModelAdapter(tools, loadRuntimeConfig, runtime)
   let messages: ChatMessage[] = [
     {
       role: 'system',

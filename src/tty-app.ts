@@ -885,7 +885,7 @@ export async function runTtyApp(args: TtyAppArgs): Promise<void> {
       showCursor()
       exitAlternateScreen()
       process.stdin.pause()
-      process.stdout.write('mini-code exited.\n')
+      process.stdout.write('nordic-bot exited.\n')
     }
 
     const finish = () => {
