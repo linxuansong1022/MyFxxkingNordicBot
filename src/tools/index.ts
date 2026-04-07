@@ -4,6 +4,7 @@ import { createMcpBackedTools } from '../mcp.js'
 import { discoverSkills } from '../skills.js'
 import { ToolRegistry } from '../tool.js'
 import { askUserTool } from './ask-user.js'
+import { countLinesTool } from './count-lines.js'
 import { editFileTool } from './edit-file.js'
 import { grepFilesTool } from './grep-files.js'
 import { listFilesTool } from './list-files.js'
@@ -51,6 +52,7 @@ export async function createDefaultToolRegistry(args: {
     listFilesTool,
     grepFilesTool,
     readFileTool,
+    countLinesTool,
     writeFileTool,
     modifyFileTool,
     editFileTool,

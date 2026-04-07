@@ -1,8 +1,23 @@
+// config.ts
+// 职责：把分散在多个文件 + 环境变量里的配置，合并成一个统一的 RuntimeConfig 对象
+//
+// 核心思想：多层配置合并 + 优先级覆盖
+// 配置来源（从低到高）：
+//   1. ~/.claude/settings.json          （Claude Code 的全局设置，兼容用）
+//   2. ~/.mini-code/mcp.json             （全局 MCP 服务器列表）
+//   3. ./.mcp.json                       （项目级 MCP 服务器列表）
+//   4. ~/.mini-code/settings.json        （本项目的全局设置：模型、API key 等）
+//   5. process.env                       （环境变量，最高优先级）
+//
+// 后面的来源覆盖前面的，跟 CLAUDE.md 的"项目覆盖全局"是同一个思路：
+// 越具体的配置越优先。
+
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { isEnoentError } from './utils/errors.js'
 
+// 用户写在 settings.json 里的原始格式（部分字段可选）
 export type MiniCodeSettings = {
   env?: Record<string, string | number>
   model?: string
@@ -21,18 +36,22 @@ export type McpServerConfig = {
   protocol?: 'auto' | 'content-length' | 'newline-json' | 'streamable-http'
 }
 
+// 整个项目运行时的"圣经"：所有 adapter / 工具 / 权限系统都拿这个对象做决策
+// 这是 loadRuntimeConfig() 的最终输出，所有合并、覆盖、兜底都已经处理完了
 export type RuntimeConfig = {
-  model: string
-  baseUrl: string
-  authToken?: string
-  apiKey?: string
-  maxOutputTokens?: number
-  mcpServers: Record<string, McpServerConfig>
-  sourceSummary: string
+  model: string                                // 用哪个模型（决定调用哪家 adapter）
+  baseUrl: string                              // API 端点
+  authToken?: string                           // Bearer token（Claude / Vertex AI 用）
+  apiKey?: string                              // API key（Gemini / OpenAI 等用）
+  maxOutputTokens?: number                     // 单次响应的最大 token 数
+  mcpServers: Record<string, McpServerConfig>  // 已合并的 MCP 服务器列表
+  sourceSummary: string                        // 配置来源说明（用于调试）
 }
 
 export type McpConfigScope = 'user' | 'project'
 
+// 所有配置文件的路径常量
+// 用 os.homedir() 而不是写死 → 跨用户、跨平台可用（与 prompt.ts 同一思路）
 export const MINI_CODE_DIR = path.join(os.homedir(), '.mini-code')
 export const MINI_CODE_SETTINGS_PATH = path.join(MINI_CODE_DIR, 'settings.json')
 export const MINI_CODE_HISTORY_PATH = path.join(MINI_CODE_DIR, 'history.json')
@@ -66,6 +85,9 @@ export async function saveMcpTokensFile(
   await writeFile(filePath, `${JSON.stringify(tokens, null, 2)}\n`, 'utf8')
 }
 
+// 安全读取 settings 文件：文件不存在时返回空对象，不抛异常
+// 跟 prompt.ts 的 maybeRead 是同一个套路：把"可选文件"的不存在翻译成"空值"
+// 但注意：只兜底 ENOENT（文件不存在），其他错误（权限、JSON 损坏）仍然抛出
 async function readSettingsFile(filePath: string): Promise<MiniCodeSettings> {
   try {
     const content = await readFile(filePath, 'utf8')
@@ -133,6 +155,16 @@ export async function saveScopedMcpServers(
   )
 }
 
+// === 配置合并的核心函数 ===
+//
+// 把两份 settings 合并成一份，override 覆盖 base
+// 但"覆盖"不是粗暴地整个替换，而是分字段做深合并：
+//   - 普通字段（model 等）：override 覆盖 base
+//   - env：两份合并，override 的 key 覆盖 base 的 key
+//   - mcpServers：按服务器名称合并，同名服务器的 env / headers 也分别深合并
+//
+// 为什么要深合并：用户可能在全局配了 MCP 服务器 A 的基础参数，
+// 在项目级只想加一个环境变量，而不是把整个 A 重写一遍。
 function mergeSettings(
   base: MiniCodeSettings,
   override: MiniCodeSettings,
@@ -167,6 +199,17 @@ function mergeSettings(
   }
 }
 
+// === 多层配置加载入口 ===
+//
+// 把 4 个来源的配置文件按顺序合并成一份"有效设置"
+// 关键点：
+//   1. 用 Promise.all 并行读取 4 个文件（IO 不互相依赖，能并行就并行）
+//   2. 用嵌套 mergeSettings 体现优先级：越外层调用 = 优先级越高
+//
+// 优先级（从低到高）：
+//   claudeSettings  →  globalMcpConfig  →  projectMcpConfig  →  miniCodeSettings
+//
+// 注意：环境变量还没参与合并，那一层在 loadRuntimeConfig 里处理
 export async function loadEffectiveSettings(): Promise<MiniCodeSettings> {
   const [claudeSettings, globalMcpConfig, projectMcpConfig, miniCodeSettings] =
     await Promise.all([
@@ -197,8 +240,20 @@ export async function saveMiniCodeSettings(
   )
 }
 
+// === 整个 config.ts 的最终入口 ===
+//
+// 这是 index.ts 启动时调用的函数，输出整个项目运行所需的全部配置
+//
+// 流程：
+//   1. 加载并合并 4 个文件（loadEffectiveSettings）
+//   2. 把 process.env 叠加到 env 上（环境变量优先级最高）
+//   3. 解析模型名称 → 推断 baseUrl → 推断要用哪个 API key
+//   4. 兜底校验：没有 model 或 key 就抛错（让用户立刻看到问题，而不是跑到一半失败）
 export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
   const effectiveSettings = await loadEffectiveSettings()
+
+  // env 合并：settings 文件里的 env 在前，process.env 在后
+  // → 环境变量永远覆盖文件配置，方便 CI/临时调试时覆盖
   const env = {
     ...(effectiveSettings.env ?? {}),
     ...process.env,
@@ -211,7 +266,11 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
 
   const lowerModel = model.toLowerCase()
 
-  // --- Resolve base URL by provider ---
+  // === 根据模型名前缀推断 baseUrl ===
+  // 关键设计：用户只需要写 model 名，系统自动选对应的 API 端点
+  // 例如 model="gemini-2.5-flash" → baseUrl 自动用 Google 的端点
+  //      model="claude-opus-4"     → baseUrl 自动用 Anthropic 的端点
+  // 用户也可以用环境变量手动指定，覆盖默认值（最常见的场景：本地 Ollama / LiteLLM 代理）
   const explicitBaseUrl = String(env.ANTHROPIC_BASE_URL ?? '').trim()
   let defaultBaseUrl: string
 
@@ -232,10 +291,16 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
 
   const baseUrl = explicitBaseUrl || defaultBaseUrl
 
-  // --- Resolve auth ---
+  // === 解析认证信息 ===
+  // 两种认证方式：
+  //   - authToken: Bearer token（Anthropic 官方 / Vertex AI 用）
+  //   - apiKey:    URL query 参数 / header（其他模型用）
+  // 适配器会根据模型自己选用哪个
   const authToken = String(env.ANTHROPIC_AUTH_TOKEN ?? '').trim() || undefined
 
-  // Try all known API key env vars in priority order based on model
+  // 按顺序尝试所有已知的 API key 环境变量名
+  // 用 || 短路：第一个非空的就用
+  // 这样用户配哪个都行，不用强制规定环境变量名
   const apiKey =
     String(env.ANTHROPIC_API_KEY ?? '').trim() ||
     String(env.GEMINI_API_KEY ?? '').trim() ||
@@ -254,6 +319,9 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
       ? Math.floor(parsedMaxOutputTokens)
       : undefined
 
+  // === Fail-fast 校验 ===
+  // 没有 model 或 key 直接抛错，让用户在启动时就看到问题
+  // 而不是跑到第一次调 LLM 才失败（那种错更难定位）
   if (!model) {
     throw new Error(
       `No model configured. Set "model" in ~/.mini-code/settings.json.`,
