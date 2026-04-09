@@ -16,6 +16,7 @@ import {
 } from './permissions.js'
 import { buildSystemPrompt } from './prompt.js'
 import { parseInputChunk, type ParsedInputEvent } from './tui/input-parser.js'
+import { beginTurn as beginUsageTurn } from './usage-tracker.js'
 import {
   clearScreen,
   enterAlternateScreen,
@@ -635,6 +636,7 @@ async function handleInput(
   const aggregatedEditByEntryId = new Map<number, AggregatedEditProgress>()
 
   args.permissions.beginTurn()
+  beginUsageTurn()
   try {
     const nextMessages = await runAgentTurn({
       model: args.model,

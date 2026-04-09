@@ -47,6 +47,7 @@ import type { ChatMessage } from './types.js'
 import { renderBanner } from './ui.js'
 import { runTtyApp } from './tty-app.js'
 import { runAgentTurn } from './agent-loop.js'
+import { beginTurn as beginUsageTurn } from './usage-tracker.js'
 
 async function main(): Promise<void> {
   // 获取当前工作目录（用户在哪个文件夹下运行的这个程序）
@@ -235,6 +236,8 @@ async function main(): Promise<void> {
 
       // 开始一个"权限回合"（本轮内相同操作只审批一次）
       permissions.beginTurn()
+      // 同时开启一个 usage 回合，给 /cost 的 "Last turn" 视图用
+      beginUsageTurn()
       try {
         // 🔄 调用核心循环！
         // AI 会在这里思考、调工具、再思考... 直到给出最终回复

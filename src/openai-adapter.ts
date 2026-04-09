@@ -2,6 +2,7 @@ import process from 'node:process'
 import type { ToolRegistry } from './tool.js'
 import type { ChatMessage, ModelAdapter, AgentStep, StepDiagnostics, ToolCall } from './types.js'
 import type { RuntimeConfig } from './config.js'
+import { recordUsage } from './usage-tracker.js'
 
 /**
  * OpenAI Chat Completions API adapter.
@@ -58,6 +59,14 @@ type OpenAIChoice = {
 type OpenAIResponse = {
   choices?: OpenAIChoice[]
   error?: { message?: string; code?: string }
+  model?: string
+  usage?: {
+    prompt_tokens?: number
+    completion_tokens?: number
+    prompt_tokens_details?: {
+      cached_tokens?: number
+    }
+  }
 }
 
 // --- helpers ---
@@ -275,6 +284,20 @@ export class OpenAIModelAdapter implements ModelAdapter {
     if (!response.ok) {
       const errMsg = data.error?.message || `Request failed: ${response.status}`
       throw new Error(errMsg)
+    }
+
+    // 把账单（usage）写进 tracker，给 /cost 命令读。
+    // OpenAI 的 prompt_tokens 已经包含 cached_tokens（是前者的子集），
+    // 对齐 tracker 的 uncachedInput = inputTokens - cachedTokens 公式。
+    // reasoning token（o1/o3）已经内含在 completion_tokens 里，不需要单独加。
+    if (data.usage) {
+      const usage = data.usage
+      recordUsage({
+        inputTokens: usage.prompt_tokens ?? 0,
+        outputTokens: usage.completion_tokens ?? 0,
+        cachedTokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+        model: data.model ?? runtime.model,
+      })
     }
 
     // Parse response

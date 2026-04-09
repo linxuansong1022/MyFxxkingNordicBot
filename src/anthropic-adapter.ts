@@ -1,6 +1,7 @@
 import type { ToolRegistry } from './tool.js'
 import type { ChatMessage, ModelAdapter, StepDiagnostics, ToolCall } from './types.js'
 import type { RuntimeConfig } from './config.js'
+import { recordUsage } from './usage-tracker.js'
 
 const DEFAULT_MAX_RETRIES = 4
 const BASE_RETRY_DELAY_MS = 500
@@ -279,10 +280,35 @@ export class AnthropicModelAdapter implements ModelAdapter {
       stop_reason?: string
       content?: AnthropicContentBlock[]
       error?: { message?: string }
+      model?: string
+      usage?: {
+        input_tokens?: number
+        output_tokens?: number
+        cache_creation_input_tokens?: number
+        cache_read_input_tokens?: number
+      }
     }
 
     if (!response.ok) {
       throw new Error(extractErrorMessage(data, response.status))
+    }
+
+    // 把账单（usage）写进 tracker，给 /cost 命令读。
+    // Anthropic 的 input_tokens 不包含 cache_read 部分，所以要把两者相加
+    // 以对齐 tracker 的公式 uncachedInput = inputTokens - cachedTokens。
+    // cache_creation 按普通 input 计价（tracker 不区分写缓存折扣）。
+    if (data.usage) {
+      const usage = data.usage
+      const inputTokens =
+        (usage.input_tokens ?? 0) +
+        (usage.cache_creation_input_tokens ?? 0) +
+        (usage.cache_read_input_tokens ?? 0)
+      recordUsage({
+        inputTokens,
+        outputTokens: usage.output_tokens ?? 0,
+        cachedTokens: usage.cache_read_input_tokens ?? 0,
+        model: data.model ?? runtime.model,
+      })
     }
 
     const toolCalls: ToolCall[] = []

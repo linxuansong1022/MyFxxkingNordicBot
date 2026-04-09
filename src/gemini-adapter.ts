@@ -14,6 +14,7 @@ import process from 'node:process'
 import type { ToolRegistry } from './tool.js'
 import type { ChatMessage, ModelAdapter, AgentStep, StepDiagnostics, ToolCall } from './types.js'
 import type { RuntimeConfig } from './config.js'
+import { recordUsage } from './usage-tracker.js'
 
 const DEFAULT_MAX_RETRIES = 4
 const BASE_RETRY_DELAY_MS = 500
@@ -59,8 +60,18 @@ type GeminiCandidate = {
   finishReason?: string
 }
 
+type GeminiUsageMetadata = {
+  promptTokenCount?: number
+  candidatesTokenCount?: number
+  thoughtsTokenCount?: number
+  cachedContentTokenCount?: number
+  totalTokenCount?: number
+}
+
 type GeminiResponse = {
   candidates?: GeminiCandidate[]
+  usageMetadata?: GeminiUsageMetadata
+  modelVersion?: string
   error?: { message?: string; code?: number; status?: string }
 }
 
@@ -155,11 +166,11 @@ function parseProgressMarkers(content: string): {
     prefix: string
     kind: 'final' | 'progress'
   }> = [
-    { prefix: '<final>', kind: 'final' },
-    { prefix: '[FINAL]', kind: 'final' },
-    { prefix: '<progress>', kind: 'progress' },
-    { prefix: '[PROGRESS]', kind: 'progress' },
-  ]
+      { prefix: '<final>', kind: 'final' },
+      { prefix: '[FINAL]', kind: 'final' },
+      { prefix: '<progress>', kind: 'progress' },
+      { prefix: '[PROGRESS]', kind: 'progress' },
+    ]
 
   for (const marker of markers) {
     if (trimmed.startsWith(marker.prefix)) {
@@ -270,7 +281,7 @@ export class GeminiModelAdapter implements ModelAdapter {
   constructor(
     private readonly tools: ToolRegistry,
     private readonly getRuntimeConfig: () => Promise<RuntimeConfig>,
-  ) {}
+  ) { }
 
   async next(messages: ChatMessage[]): Promise<AgentStep> {
     const runtime = await this.getRuntimeConfig()
@@ -350,6 +361,18 @@ export class GeminiModelAdapter implements ModelAdapter {
     if (!response.ok) {
       const errMsg = data.error?.message || `Gemini request failed: ${response.status}`
       throw new Error(errMsg)
+    } 2
+
+    // 把账单（usageMetadata）写进 tracker，给 /cost 命令读
+    if (data.usageMetadata) {
+      const usage = data.usageMetadata
+      recordUsage({
+        inputTokens: usage.promptTokenCount ?? 0,
+        outputTokens:
+          (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0),
+        cachedTokens: usage.cachedContentTokenCount ?? 0,
+        model: data.modelVersion ?? modelName,
+      })
     }
 
     // 6. 解析响应 → 翻译回 AgentStep

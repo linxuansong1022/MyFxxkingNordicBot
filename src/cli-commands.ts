@@ -7,6 +7,7 @@ import {
   saveMiniCodeSettings,
 } from './config.js'
 import type { ToolRegistry } from './tool.js'
+import { getTurnUsage, getUsageTotals, resetUsage } from './usage-tracker.js'
 
 export type SlashCommand = {
   name: string
@@ -61,6 +62,16 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     description: 'Show mini-code permission storage path.',
   },
   {
+    name: '/cost',
+    usage: '/cost',
+    description: 'Show token usage and estimated cost for the current session.',
+  },
+  {
+    name: '/cost',
+    usage: '/cost reset',
+    description: 'Reset session token usage counter.',
+  },
+  {
     name: '/exit',
     usage: '/exit',
     description: 'Exit mini-code.',
@@ -111,6 +122,55 @@ export function formatSlashCommands(): string {
   return SLASH_COMMANDS.map(command => `${command.usage}  ${command.description}`).join('\n')
 }
 
+// 把整数加千位分隔（1234567 → "1,234,567"）
+function formatNumber(n: number): string {
+  return n.toLocaleString('en-US')
+}
+
+// 把美元金额格式化（小金额带 ~ 号表示估算）
+function formatCost(usd: number): string {
+  if (usd < 0.01) {
+    return `~$${usd.toFixed(6)}`
+  }
+  return `~$${usd.toFixed(4)}`
+}
+
+// 格式化一段 UsageTotals 成多行字符串。title 决定第一行的标签。
+function formatUsageBlock(title: string, totals: import('./usage-tracker.js').UsageTotals): string[] {
+  const uncached = totals.totalInputTokens - totals.totalCachedTokens
+  const cacheHitRate =
+    totals.totalInputTokens > 0
+      ? Math.round((totals.totalCachedTokens / totals.totalInputTokens) * 100)
+      : 0
+
+  return [
+    `${title}:`,
+    `  LLM calls:       ${totals.callCount}`,
+    `  Input tokens:    ${formatNumber(totals.totalInputTokens)} (${formatNumber(uncached)} fresh + ${formatNumber(totals.totalCachedTokens)} cached, ${cacheHitRate}% hit rate)`,
+    `  Output tokens:   ${formatNumber(totals.totalOutputTokens)}`,
+    `  Estimated cost:  ${formatCost(totals.estimatedCostUsd)}`,
+    `  Models used:     ${totals.models.join(', ') || '(unknown)'}`,
+  ]
+}
+
+function formatUsageReport(): string {
+  const session = getUsageTotals()
+
+  if (session.callCount === 0) {
+    return 'No LLM calls recorded yet in this session.'
+  }
+
+  const turn = getTurnUsage()
+  const turnBlock =
+    turn.callCount === 0
+      ? ['Last turn:', '  No calls in current turn yet.']
+      : formatUsageBlock('Last turn', turn)
+
+  const sessionBlock = formatUsageBlock('Session total', session)
+
+  return [...turnBlock, '', ...sessionBlock].join('\n')
+}
+
 export function findMatchingSlashCommands(input: string): string[] {
   return SLASH_COMMANDS
     .map(command => command.usage)
@@ -142,6 +202,15 @@ export async function tryHandleLocalCommand(
 
   if (input === '/permissions') {
     return `permission store: ${MINI_CODE_PERMISSIONS_PATH}`
+  }
+
+  if (input === '/cost') {
+    return formatUsageReport()
+  }
+
+  if (input === '/cost reset') {
+    resetUsage()
+    return 'Session token usage counter reset.'
   }
 
   if (input === '/skills') {
