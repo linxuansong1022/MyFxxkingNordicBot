@@ -1204,6 +1204,12 @@ minicode skills remove myskill                     # 卸载
 | `list_files` | list-files.ts | `readdir()` 列目录，标记 `dir`/`file`，最多 200 条 |
 | `grep_files` | grep-files.ts | 调用 `rg`（ripgrep）搜索文件内容 |
 
+#### 元数据工具
+
+| 工具 | 文件 | 行为 |
+|------|------|------|
+| `count_lines` | count-lines.ts | 数一个 UTF-8 文本文件的行数。返回 `FILE: ...\nLINES: N`。设计目的：让 LLM 不用 read_file 把整个文件塞进 context 也能拿到行数，把 O(文件大小) 的 token 开销压成 O(1) |
+
 #### 命令执行
 
 | 工具 | 文件 | 行为 |
@@ -1300,6 +1306,1555 @@ Mock adapter 硬编码了一些 slash 命令的响应：
 
 ---
 
+### 4.16 用量统计（usage-tracker.ts）
+
+#### 一句话定位
+
+> **`usage-tracker.ts` = 一个共享小本子**。adapter 在每次 LLM 调用结束后写入一笔账单，`/cost` 命令在被触发时读出累计值。两个互不认识的模块通过这个中立模块交换数据。
+
+#### 解决的问题
+
+加 `/cost` 命令时遇到一个跨模块协作问题：
+- **数据产生方**：`gemini-adapter.ts`，每次响应里都有 `usageMetadata`（账单）
+- **数据使用方**：`cli-commands.ts`，用户输入 `/cost` 时要展示累计值
+
+让两个模块直接对话会造成耦合（adapter 不该知道斜杠命令的存在，反之亦然）。引入第三方中立模块解决——adapter 只负责"写"，cli-commands 只负责"读"，互不见面。
+
+#### 设计要点
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 状态存储 | 模块级单例（`let records: UsageRecord[]`） | mini-code 是单进程 CLI，不需要 IoC 容器 |
+| 状态更新 | `records = [...records, x]`，不用 `push` | 保持 immutable update，旧快照不受新写入影响 |
+| 写入/读取类型分离 | `UsageRecord`（写）+ `UsageTotals`（读） | 两边的关注点不同，类型即接口 |
+| 价格表 | 写死在模块内部，不 export | 实现细节，外面只看到最终 `estimatedCostUsd` |
+| 模型名匹配 | `startsWith` 模糊匹配 | 兼容带后缀的版本名（gemini-2.5-flash-001） |
+| 字段缺失处理 | `?? 0`，不报错 | 辅助功能要"有结果"，不要因为某个字段缺失就崩 |
+| 价格表外的模型 | 用默认价格（Flash），不报错 | 估算 > 准确，标注 `~` 表示估算 |
+
+#### 公开 API
+
+```ts
+recordUsage(record: UsageRecord): void   // adapter 调，记一笔
+getUsageTotals(): UsageTotals            // /cost 调，读累计
+resetUsage(): void                        // /cost reset 调，清空
+```
+
+#### 数据流（端到端）
+
+```
+用户问问题
+   ↓
+gemini-adapter.next()
+   ├─ 翻译消息 → 发 HTTP 请求
+   ├─ 收响应 → 解析 candidates（主业）
+   └─ 解析 usageMetadata → recordUsage(...)  ← 写入
+                                ↓
+                       usage-tracker
+                       （records 数组累加）
+                                ↑
+用户输入 /cost                  │
+   ↓                            │
+cli-commands.tryHandleLocalCommand
+   └─ formatUsageReport()
+       └─ getUsageTotals()  ← 读取
+```
+
+**关键点：adapter 对外接口完全没变**——agent-loop 和上层代码完全不知道有 tracker 存在。这是"扩展开放、修改封闭"的实战写法。
+
+#### 三家 adapter 的 usage 字段对照表
+
+三家供应商都返回账单数据，但字段名和语义全都不一样。adapter 的一大职责就是**把各家的怪癖翻译成 tracker 的统一格式** `UsageRecord`。
+
+| `UsageRecord` 字段 | Gemini (`usageMetadata.*`) | Anthropic (`usage.*`) | OpenAI (`usage.*`) |
+|---|---|---|---|
+| `inputTokens` | `promptTokenCount` | `input_tokens` | `prompt_tokens` |
+| `outputTokens` | `candidatesTokenCount + thoughtsTokenCount` | `output_tokens` | `completion_tokens` |
+| `cachedTokens` | `cachedContentTokenCount` | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens` |
+| `model` | `modelVersion`（顶层字段） | `model`（顶层字段） | `model`（顶层字段） |
+
+**重点差异**：
+
+1. **"推理 token" 在哪里记**
+   - Gemini 2.5 的 thinking token（`thoughtsTokenCount`）是**单独字段**，要手动加到 output 里
+   - Anthropic 的 extended thinking token 已经**内含在** `output_tokens` 里
+   - OpenAI 的 o1/o3 reasoning token 也已经**内含在** `completion_tokens` 里
+   - 结论：三家里只有 Gemini 要做加法，另外两家直接取就行
+
+2. **"缓存"字段的陷阱**
+   - Anthropic 有两个缓存字段：`cache_creation_input_tokens`（写缓存，比普通 input 贵 25%）和 `cache_read_input_tokens`（读缓存，只要普通 input 的 10%）。**我们只把"读"算作 `cachedTokens`**——"写"按普通 input 记，否则成本估算会偏低
+   - OpenAI 的缓存字段嵌套在 `prompt_tokens_details` 里，要用可选链 `?.` 访问
+   - Gemini 的 `cachedContentTokenCount` 直接放顶层，最干净
+
+3. **`input_tokens` 是不是已经去掉缓存？**
+   - Anthropic：`input_tokens` **不包含** cache_read 部分（两个加起来才是总 input）
+   - OpenAI：`prompt_tokens` **包含** cached_tokens（后者是前者的子集）
+   - Gemini：`promptTokenCount` **包含** cachedContentTokenCount（后者是前者的子集）
+   - 这直接影响 `calcCost()` 里算"非缓存 input"的逻辑。当前 tracker 的公式 `uncachedInput = inputTokens - cachedTokens` 只对 Gemini 和 OpenAI 正确；**对 Anthropic 偏低**。修正方式：Anthropic adapter 写入时，把 `inputTokens` 设成 `input_tokens + cache_read_input_tokens`，让后续公式统一
+
+#### 当前局限
+
+- **价格表是估算值**——硬编码在 `PRICE_TABLE` 里，模型版本更新后可能过时，所有金额都标 `~` 表示估算
+- **会话级粒度**——除了 turn 级差值外，没有更细粒度（比如按工具调用分账）
+- **Anthropic 写缓存（cache_creation）按普通 input 计价**，没有单独的"写缓存贵 25%"条目——这会让启用 prompt caching 的会话账单略微偏低
+
+#### 扩展方向
+
+新增 adapter 时的接入模板：
+1. `import { recordUsage } from './usage-tracker.js'`
+2. 在响应 JSON 类型里补上 `usage` + `model` 字段
+3. 在 `if (!response.ok) throw` 之后、解析内容之前，调用 `recordUsage({ ... })`，按本节的对照表填字段
+4. 在 `PRICE_TABLE` 里加入新模型的价格条目
+
+#### Turn 级粒度（已规划）
+
+`/cost` 当前只显示 session 累计。用户经常想知道**刚才那一句话**花了多少——这是一个比 session 更细、比 call 更粗的粒度，称为 turn。
+
+##### 三种粒度
+
+| 粒度 | 边界 | 包含 |
+|---|---|---|
+| session | 启动 → 退出 | 多个 turn |
+| **turn** | 用户按一次回车 → AI 答完 | 1+ 个 call |
+| call | 一次 HTTP 往返 | 一次响应 |
+
+##### 设计：快照差值模式
+
+不给每条 record 打 turn 标签，而是在 turn 开始时拍一张"当前累计快照"，查询时用"当前累计 - 快照"得到这一轮的消耗。
+
+为什么用快照差值而不是给每条 record 打 turn 标签：
+- **改动小**：tracker 内部只多一个变量（`turnStartSnapshot`），records 数组结构不变
+- **写入路径不动**：adapter 调 `recordUsage` 时完全不需要知道 turn 概念
+- **跟现有抽象对齐**：和 `permissions.beginTurn()` 是同一个模式，认知负担小
+
+##### 新增 API
+
+```ts
+beginTurn(): void              // index.ts 主循环在每条用户输入前调
+getTurnUsage(): UsageTotals    // /cost 调，返回 "当前 - 快照" 的差值
+```
+
+`endTurn()` 不需要——turn 没有"结束"的概念，下一个 `beginTurn()` 会覆盖快照。
+
+##### 改动范围
+
+| 文件 | 改什么 |
+|---|---|
+| `usage-tracker.ts` | 加快照变量 + 两个新 API |
+| `index.ts` | 主循环里在 `permissions.beginTurn()` 旁边调 `usageTracker.beginTurn()` |
+| `cli-commands.ts` | `/cost` 同时显示 "Last turn" 和 "Session total" 两块 |
+
+注意 **adapter 完全不动**——turn 概念只在写入和读取的"边界"上，写入路径无感。
+
+##### `/cost` 新输出格式
+
+```
+Last turn:
+  LLM calls:       3
+  Input tokens:    4,521 (1,200 fresh + 3,321 cached, 73% hit rate)
+  Output tokens:   42
+  Estimated cost:  ~$0.000178
+
+Session total:
+  LLM calls:       7
+  Input tokens:    9,832 (...)
+  ...
+```
+
+##### 边界情况
+
+- **session 第一条消息之前** → Last turn 显示 "No calls in current turn yet."
+- **用户连发两次 `/cost`** → Last turn 仍然显示上一个 turn 的差值（快照没动）
+- **`/cost reset`** → 同时清空 records 和 snapshot
+
+---
+
+### 4.17 上下文压缩（context-compactor.ts — 设计规划中）
+
+**状态**：🚧 规划中，实现方案待决。本节在 Socratic 对话过程中逐步累积设计约束和决策。
+
+#### 一句话定位
+
+> **将过长的 `messages: ChatMessage[]` 压缩成更短的版本，同时保证下一次 `model.next()` 调用仍然合法可用。**
+
+#### 问题背景
+
+当会话变长，`messages` 数组会无限增长。三个后果同时发生：
+
+1. **成本爆炸**：LLM 是无状态的，每次调用都要重发整个历史。100k token 输入 × $15/M ≈ $1.5 一次，20 轮就是 $30
+2. **延迟恶化**：输入越长，首 token 延迟越高
+3. **Lost in the Middle**：中间段的 token 召回率下降——这不是 attention 的 bug，是训练数据先验（首尾重要、中间填充）让模型学到的偏见。softmax 稀释进一步加剧：上下文从 1k 到 100k，关键 token 的有效权重被稀释 100 倍
+
+**关键观察**：扩大 context window（Claude 200k、Gemini 1M）**不解决这个问题**，只是把「崩溃」变成「贵且笨」。
+
+#### 🔒 铁律 #1：消息数组的配对约束
+
+**这是任何压缩策略的第一红线。**
+
+`ChatMessage[]` 不是线性序列，是**带配对约束的序列**：
+
+```
+assistant_tool_call(toolUseId='abc') ──┐
+                                       ├─ 硬绑定，不能拆
+tool_result(toolUseId='abc')       ────┘
+```
+
+Anthropic / OpenAI / Gemini **三家 API 都在协议层强制这条约束**。Anthropic 的错误信息最直白：
+
+```
+HTTP 400: tool_result block found with no preceding tool_use block
+```
+
+**为什么 API 要这么严？**（两层原因）
+
+1. **协议无歧义**：function calling 必须是"请求-响应"原子事务。半成品 = 无意义 = 拒绝
+2. **防幻觉**：如果允许孤儿 `tool_result`，LLM 会幻觉出一个不存在的工具调用上下文，自己编造"我刚才调了什么、为什么调"。这对 agent 是灾难——每一步都依赖前一步的真实结果，一次幻觉会污染后续所有决策
+
+**工程原则**：**Fail loud, fail fast**。API 选择拒收，而不是让下游在无意义状态下继续跑。
+
+#### 🎯 对压缩策略的约束
+
+铁律 #1 直接淘汰或约束了多个方案：
+
+| 朴素策略 | 为什么出问题 |
+|---|---|
+| `messages.slice(-K)` 滑动窗口 | ❌ 按索引切，可能正好切在配对中间 |
+| 随机丢弃"不重要"的消息 | ❌ 可能丢掉配对的一半 |
+| 按角色过滤（比如只留 user + assistant） | ❌ 扔掉 tool_result 后 tool_call 变孤儿 |
+
+**任何合法的压缩函数必须满足的不变式**：
+
+> 对所有存在的 `assistant_tool_call(id=X)`，输出数组里**要么同时包含对应的 `tool_result(id=X)`**，**要么两者都不包含**。
+
+#### 🧰 哪些消息可以被安全摘要？3 维决策框架
+
+判断一条 `tool_result` 能不能被摘要掉，**不是只看"有没有副作用"**，而是 3 个维度的组合：
+
+| 维度 | 问题 | 影响 |
+|---|---|---|
+| **1. 可重放性** | 再调一次能拿到同样结果吗？ | 可重放 = 可摘要（需要时重跑） |
+| **2. 副作用落地** | 副作用有没有在外部系统留下痕迹？ | 副作用已持久化 = 可摘要（痕迹就是记忆） |
+| **3. 结果是否是唯一记录** | 这条消息是不是某个信息的唯一来源？ | 是 = **绝对不能摘要** |
+
+**反直觉观察**：「有副作用」反而让工具**更容易**被摘要。比如 `write_file`——它的副作用就在文件系统里，之后 `read_file` 能随时重读当前内容。摘要掉旧的 `write_file` 结果没关系。
+
+**真正危险的是 `ask_user`**：它没有副作用，但 `tool_result` 里用户的回答是**唯一记录**，摘要掉 = 永久丢失用户原话。
+
+#### MiniCode 工具的摘要安全性分类
+
+| 工具 | 可重放 | 副作用落地 | 摘要策略 |
+|---|---|---|---|
+| `read_file` | ✅ | - | ✅ 可摘要（需要时重读） |
+| `list_files` | ✅ | - | ✅ 可摘要 |
+| `grep_files` | ✅ | - | ✅ 可摘要 |
+| `write_file` | ✅ | ✅ 在磁盘 | ✅ 可摘要 |
+| `edit_file` / `patch_file` / `modify_file` | ✅ | ✅ 在磁盘 | ✅ 可摘要 |
+| `run_command` | ⚠️ 看命令 | ⚠️ 看命令 | ⚠️ **保守策略：留原文**（见安全名单） |
+| `web_fetch` | ⚠️ 内容可能变 | - | ⚠️ 通常留原文 |
+| `web_search` | ❌ 结果随时间变 | - | ❌ 留原文 |
+| `ask_user` | ❌ | - | ❌❌ **绝对留原文**——用户答案是唯一记录 |
+| `load_skill` | ✅ | - | ✅ 可摘要 |
+
+#### 💰 压缩的经济学：两种成本
+
+压缩一条大 `tool_result`，你面对**两种不同性质的成本**：
+
+**成本 A：保留成本（确定的）**
+
+如果不压缩，原文每次调用都要重发：
+```
+cost_keep = K × R
+```
+- `K` = 剩余对话轮数
+- `R` = 原文 token 数
+- **确定付**——不管后续用不用，都要付
+
+**成本 B：重放成本（条件的）**
+
+如果压缩：
+```
+cost_compress = S × K + P × R
+```
+- `S` = 摘要 token 数（≪ R）
+- `P` = 未来真的需要这段信息的概率
+- **只在 LLM 真的需要时才付 `P × R`**
+
+**压缩划算的条件**：
+```
+S × K + P × R  <  K × R
+↓
+P  <  K × (R - S) / R
+```
+
+**翻译成直觉**：
+- `R` 越大（原文越大），压缩越划算——因为 `K × R` 滚雪球
+- `K` 越大（剩余轮数越多），压缩越划算——保留成本线性增长
+- `P` 越小（被再次引用概率越低），压缩越划算
+
+**关键结论**：**大的 `tool_result` 几乎总是该被压缩**——因为保留它的代价随对话轮数线性增长，滚雪球。小的 `tool_result` 反而不值得压缩，因为省的 token 连摘要本身都抵不掉。
+
+##### 成本速查表（面试备忘）
+
+Claude Sonnet 4.x 的典型价位作为基准（$3/M input，$15/M output）：
+
+| 输入 token | 单次调用成本 | 20 轮累计成本 | 建议动作 |
+|---|---|---|---|
+| 30k（≈15%） | ~$0.09 | ~$1.80 | 🟢 无需压缩 |
+| 60k（≈30%） | ~$0.18 | ~$3.60 | 🟢 继续观察 |
+| 120k（≈60%） | ~$0.36 | ~$7.20 | 🟡 **Tier 1 触发**（60% 阈值）|
+| 174k（≈87%） | ~$0.52 | ~$10.44 | 🔴 **Tier 2 触发**（87% 阈值）|
+| 190k（≈95%） | ~$0.57 | ~$11.40 | 🚨 **Tier 3-Lite + 强提示** |
+
+**用这张表答面试题**：
+- Q: "30k vs 150k 成本差多少？" → A: "单次调用差 5 倍（$0.09 vs $0.45），20 轮累计差 $7.20"
+- Q: "什么时候应该手动 /compact？" → A: "在 Tier 1 能处理的 60~87% 区间不需要；超过 87% 系统会自动触发 Tier 2；但如果你知道某轮之后会聊很久，在 60% 就手动 /compact 能节省后续的 `K × R` 滚雪球成本"
+
+**注意**：这些数字会过期（价格会变），但**数量级不会**——这是为什么压缩不是可选项。
+
+#### 🎲 核心难题：P 的不可知性
+
+上面的公式看起来很工程化，但有一个字段**你根本无法精确知道**——`P`，未来引用这段信息的概率。
+
+- 用户刚才让你读了 `config.ts`——他下一句是要你改 port？聊别的？你不知道
+- 用户刚才 grep 了一个关键字——他会追问细节吗？你不知道
+- 这个 tool_result 是关键信息还是噪音？**你不知道**
+
+**这才是上下文压缩的真正困难**：
+
+> **压缩策略的本质不是"算法怎么实现"，而是"你如何预测 P"。所有策略都是对 P 的某种启发式估计。**
+
+#### 5 种策略对 P 的假设
+
+| 策略 | 对 P 的假设 | 代表实现 |
+|---|---|---|
+| **滑动窗口** | P 随时间衰减——近期 P 高，远期 P 低 | LangChain `BufferWindowMemory` |
+| **纯摘要** | 所有原始细节 P 都很低，只有语义结论重要 | LangChain `SummaryMemory` |
+| **摘要 + 近窗混合** | 近期 P 高（保留原文），远期 P 低（摘要） | **Claude Code `/compact`**, Cursor auto-summary |
+| **按工具类型（幂等性）** | P 由工具类型决定，与语义无关 | 未见成熟工业实现 |
+| **LLM 自判断** | 外包 P 的估计——让 LLM 读对话自己决定 | Claude Code 的摘要 prompt 内部就是这么做的 |
+
+**关键洞察**：**Claude Code 的聪明在于把 P 估计外包给 LLM 本身**。它不写死规则，而是让摘要过程中的 LLM 读对话内容，自己判断"这段对后续重要吗"——重要的留在摘要里，不重要的扔掉。
+
+这等于**用 LLM 的语义理解能力替代了人类写死的启发式**。
+
+#### ✅ 选型决定：三层架构（Tier 1 + Tier 2 + Tier 3）
+
+**决策依据**：2025 年 Claude Code 部分源码泄露后，社区整理出其上下文管理系统的真实结构。本节直接对齐其架构作为 MiniCode 的实施蓝本。参考：[Claude Code Complete Guide — Part 8: Context Management](https://bcefghj.github.io/claude-code-complete-guide_v2/part08-context-management/)
+
+**核心洞察**：**不同强度的压缩对应不同成本**。瀑布式递进——先尝试零成本清理，够用就停；不够再调 LLM；极端时才动用有损压缩。
+
+##### 架构图
+
+```
+            ┌─────────────────────────────────────────────────────┐
+            │  触发检测器（每次 model.next() 前计算 token 占用率）  │
+            └──────────────────┬──────────────────────────────────┘
+                               │
+         ┌─────────────────────┼──────────────────────┐
+         │                     │                      │
+       < 60%              60% ~ 87%                 > 87%
+         │                     │                      │
+         ▼                     ▼                      ▼
+      直接通过            Tier 1 清理            Tier 2 摘要
+      (什么都不做)        (零成本本地)           (调摘要 LLM)
+                               │                      │
+                               │                      │  失败 3 次
+                               │                      ▼
+                               │                熔断 → 回退到
+                               │                Tier 1 + 用户提示
+                               │
+                            > 95%
+                               │
+                               ▼
+                      Tier 3 极端（可选，第一版不做）
+```
+
+##### Tier 1：本地零成本清理
+
+- **触发**：占用率 ≥ 60%
+- **成本**：0（纯本地代码，不调任何 LLM）
+- **清理规则**（第一版实现 3 条）：
+  1. **同文件去重**：对同一个文件的多次 `read_file`，只保留最新一次的 `tool_result`（旧的被新的覆盖了）
+  2. **删失败重试**：连续失败的同一工具调用，只保留最后一次错误（重复错误无信息量）
+  3. **折叠冗余工具输出**：如果两次 `list_files` / `grep_files` 参数和输出都相同，只保留一条
+- **保持不变式**：删除时必须保持 `tool_call ↔ tool_result` 配对完整（删结果时连带删对应调用）
+- **预期节省**：20~30% token
+- **为什么先试这一层**：**不花钱、不拖延、不损失语义**——纯粹扔掉机械冗余。没理由跳过
+
+##### Tier 2：LLM 摘要 + 近窗保留 + 安全名单
+
+- **触发**：占用率 ≥ 87%（Tier 1 做过但仍不够）
+- **成本**：一次快速模型调用（Haiku / Flash），几千 token input + 几百 token output
+- **机制**：
+  1. **切分点**：保留最近 M 条消息作为"近窗"原文（`M ≈ 20% × context_window`）
+  2. **配对保护**：切分点若落在 `assistant_tool_call` / `tool_result` 中间，整对推入旧区或整对拉入近窗——不能拆
+  3. **安全名单**：旧区里的 `ask_user` 结果和非幂等 `run_command` 永远保留原文，不进摘要
+  4. **摘要调用**：被摘要部分交给摘要 LLM，生成 `context_summary` 文本
+  5. **组装**：`messages = [system, context_summary, ...safety_list, ...recent_window]`
+- **熔断机制**：摘要调用连续失败 3 次 → 熔断 Tier 2，回退到 Tier 1 + 提示用户"自动摘要失败，请手动 /compact"
+- **为什么 87% 而不是 70%**：留给 Tier 1 足够空间尝试。只有 Tier 1 也救不了时才为语义理解付费
+- **关于 Tier 2 内部的决策细节**：前面的"3 维决策框架"、"工具分类表"、"经济学公式 P × R"、"P 的不可知性"讨论，**全部仍然有效**——它们都是用来理解 Tier 2 内部为什么这么设计的
+
+##### Tier 3-Lite：简化版极端压缩（第一版实现）
+
+- **触发**：
+  - 自动：Tier 1 + Tier 2 之后仍 > 95%（实际极少发生）
+  - 手动：用户敲 `/compact --deep`
+- **Claude Code 的完整版 vs MiniCode 的简化版**：
+
+| 想法 | Claude Code 完整版 | MiniCode Tier 3-Lite |
+|---|---|---|
+| 结构化摘要 | **九节**（task / files / decisions / tool_calls / errors / preferences / progress / unfinished / constraints） | **三节**（task / files_touched / decisions） |
+| 激进剥离 | 剥离 chain-of-thought + 中间推理 | 删除所有 `assistant_progress` 消息 |
+| 近窗缩小 | 更激进 | 从 20% → 10% |
+
+- **具体算法**：
+  1. **零成本剥离 CoT**：`messages.filter(m => m.role !== 'assistant_progress')` —— 一行代码删光所有"内心独白"
+  2. **三节结构化摘要**：把旧区消息交给摘要 LLM，但用严格的 system prompt 约束输出格式：
+     ```
+     Extract into exactly 3 sections:
+     (1) task: 当前正在做的任务是什么（一句话）
+     (2) files_touched: 动过哪些文件（数组）
+     (3) decisions: 做过的关键决定（数组）
+     Output ONLY valid JSON, no other text.
+     ```
+  3. **解析 + 序列化**：LLM 返回 JSON → 解析 → 序列化成一段结构化的 `context_summary` 文本
+  4. **近窗缩小**：从 Tier 2 的 20% 压到 **10%**（因为 Tier 3 触发本身就意味着空间极紧张）
+  5. **组装**：`messages = [system, structured_summary, ...safety_list, ...近窗(10%)]`
+
+- **为什么 Tier 3-Lite 和 Tier 2 本质不同**：
+
+| 维度 | Tier 2 | **Tier 3-Lite** |
+|---|---|---|
+| 摘要结构 | 自由文本 | **3 段结构化 JSON** |
+| `assistant_progress` 消息 | 保留 | **全删** |
+| 近窗大小 | 20% | **10%** |
+| 摘要 prompt | 开放式 | **强结构约束** |
+| 触发占用率 | 87% | **95% 或手动** |
+| 压缩率 | ~60% → 30% | ~90% → 40% |
+
+Tier 2 让 LLM 自由判断保留什么；Tier 3-Lite **用结构化约束换极端压缩率**——这是两种本质不同的策略。
+
+- **关于 Chain-of-Thought (CoT)**：MiniCode 的 `assistant_progress` role 就是这个系统里的 CoT——AI 在工具调用之间的"内心独白"，相当于最终答案的"脚手架"。CoT 对**当时**的 agent 重要（指导下一步），但对**未来**的 agent 几乎无用（工具结果已经在 `tool_result` 里，最终结论已经在后面的 `assistant` 里）。Tier 3 删除 `assistant_progress` = 接受小的语义损失换大的空间——只在 95% 极端情况才这么做。
+
+- **为什么是 3 节而不是 9 节**：
+  1. 9 节的 prompt 设计非常精细，小模型（Haiku）可能做不好
+  2. 3 节抓核心（正在做什么 / 动过哪些文件 / 有哪些决定），覆盖绝大多数用户会问的问题
+  3. 第一版够用；未来真的发现 3 节不够再扩展
+
+- **面试价值**：Tier 3-Lite 的实现证明你**真的理解了 Claude Code 的三层架构**——不是知道它，而是亲手做了简化版。面试话术：「我实现了 Tier 3 的简化版——用 3 节结构化摘要代替完整版的 9 节，用 `assistant_progress` 过滤代替完整的 CoT 剥离。核心思想完全一致：**用结构化约束换极端压缩率**。」
+
+##### 实施细节与边界情况
+
+**占用率的计算**
+
+```
+占用率 = 当前 messages 的 token 总数 / 当前模型的 context window 大小
+```
+
+**Token 数怎么算？两种方案**：
+
+| 方案 | 精度 | 代价 | 选择 |
+|---|---|---|---|
+| A. 调 Anthropic `/v1/messages/count_tokens` | 精确 | HTTP 延迟 + 可能付费 | ❌ 第一版不用 |
+| B. 字符数估算：英文 `chars/4`、中文 `chars/2`、混合 `chars/3` | ±10% | 0 | ✅ **选用** |
+
+**实施要点**：
+- 占用率的分子**只算增长部分**（user / assistant / assistant_progress / tool_call / tool_result），不算 system prompt（system 固定不变，算它没意义）
+- 每次 `model.next()` 调用**之前**计算一次
+- 误差 ±10% 对触发阈值完全够用——因为阈值本身也是经验值
+
+**摘要模型的硬约束**
+
+> **摘要模型的 context window 必须 ≥ 主模型的 context window。**
+
+这是一条硬规则，违反就会出现鸡生蛋问题——要摘要的内容塞不进摘要模型。
+
+**默认选择**：
+
+| 主模型 | 默认摘要模型 | 理由 |
+|---|---|---|
+| Claude Sonnet/Opus (200k) | **Claude Haiku (200k)** | 同家族、同 context、便宜 |
+| Gemini 2.5 Pro (1M) | **Gemini 2.5 Flash (1M)** | 同家族、同 context、便宜 |
+| GPT-5 / GPT-4o | **GPT-5-mini / GPT-4o-mini** | 同家族、同 context、便宜 |
+| 主模型找不到小型同家族 | **回退：用主模型自己** | 贵但保证 context 够用 |
+
+**规则实施**：放在 `src/config.ts` 里做一个映射表。用户也可以在配置里手动覆盖。
+
+**阈值常量的来源与可配置性**
+
+60% 和 87% 这两个数字**不是数学推导出来的最优值**——是 Claude Code 源码泄露后社区整理的真实常量。Anthropic 工程师有数百万真实会话数据去调优，MiniCode 没有，所以**直接抄**。
+
+**可配置**：所有阈值都从 `config.ts` 读取，允许环境变量覆盖：
+
+```
+MINI_CODE_COMPACT_TIER1_THRESHOLD=0.60
+MINI_CODE_COMPACT_TIER2_THRESHOLD=0.87
+MINI_CODE_COMPACT_TIER3_THRESHOLD=0.95
+MINI_CODE_COMPACT_RECENT_WINDOW_RATIO=0.20
+MINI_CODE_COMPACT_RECENT_WINDOW_RATIO_TIER3=0.10
+MINI_CODE_COMPACT_CIRCUIT_BREAKER_FAILURES=3
+```
+
+这样未来你真的用 MiniCode 用多了，发现"我的场景下 60% 太早了"，直接改环境变量就行，不用改代码。
+
+##### 触发阈值表
+
+| 占用率 | 动作 | 用户感知 |
+|---|---|---|
+| 0 ~ 59% | 无 | 无感 |
+| 60 ~ 86% | **Tier 1 自动启动** | 无感（零成本本地清理） |
+| 87 ~ 94% | **Tier 2 自动启动** + 状态栏提示 "Compacting..." | 轻微停顿（几秒） |
+| ≥ 95% | **强提示**"上下文接近极限，建议立即 /compact 或开启新会话" | 警告 |
+| 任意时刻 | 手动 `/compact` | 用户主动触发 Tier 2 |
+
+##### 为什么这样设计是"温柔渐进"
+
+三层 + 双阈值实现**分级温柔**：
+
+1. 60% 以下完全不动 → 用户无感
+2. 60~87% 偷偷清理冗余 → 用户无感
+3. 87~95% 调 LLM 摘要 → 有感但不打断
+4. 95%+ 强提示 → 用户做决定
+
+对比 "到达 70% 直接调 LLM 摘要" 的粗暴策略，三层方案：
+- **更省钱**：大部分会话停在 Tier 1 就够了
+- **更顺滑**：用户无感的占比更高
+- **更稳定**：有熔断，不会因为摘要 LLM 挂了就崩
+
+##### 与之前的 C 方案是什么关系
+
+**之前讨论的 C 方案（摘要 + 近窗 + 安全名单）其实就是 Tier 2 的具体实现方式**。三层架构没有推翻 C，而是把 C 作为中间一层，前面加了 Tier 1，后面加了 Tier 3。
+
+| 之前的 C 方案 | 现在的三层架构 |
+|---|---|
+| 摘要 + 近窗 + 安全名单 | = Tier 2 |
+| 配对保护 | 每层都满足，仍是铁律 #1 |
+| LLM 做摘要 | = Tier 2 的 LLM 调用 |
+| （无） | + Tier 1（本地清理） |
+| （无） | + Tier 3-Lite（简化版极端兜底，第一版实现） |
+| （无） | + 熔断机制 |
+| （无） | + 双阈值触发 |
+
+##### 第一版实现范围（显式声明）
+
+**做**：
+- ✅ Tier 1 本地清理（3 条规则：同文件去重、删失败重试、折叠冗余）
+- ✅ Tier 2 LLM 摘要 + 近窗 + 安全名单
+- ✅ **Tier 3-Lite**：三节结构化摘要 + 删除 `assistant_progress` + 10% 近窗
+- ✅ 双阈值触发（60% / 87%）+ 95% 触发 Tier 3-Lite
+- ✅ 熔断机制（连续失败 3 次）
+- ✅ 手动 `/compact` 命令 + `/compact --deep` 触发 Tier 3-Lite
+- ✅ 95% 强提示
+- ✅ 占用率字符数估算（误差 ±10%）
+- ✅ 摘要模型的 context window 约束（≥ 主模型）
+- ✅ 所有阈值可通过环境变量覆盖
+
+**不做**（显式声明，避免 scope creep）：
+- ❌ Claude Code 完整的 9 节摘要（我们用 3 节版本代替）
+- ❌ 调 `/v1/messages/count_tokens` 精确 token 计数（用字符估算够了）
+- ❌ 与 Anthropic prompt caching 的 `cache_edits` 前缀保护（等真正启用 prompt caching 时再做）
+- ❌ Session restore / 长会话持久化（独立 feature，spec 另开）
+- ❌ 递归摘要 / 流式摘要（第一版的简单切分就够了）
+
+##### 为什么这个架构值得直接抄
+
+1. **这是真实答案**：Claude Code 源码泄露后，业界看到他们的上下文管理用的就是三层架构。抄这个等于抄 production 系统
+2. **面试深度拉满**：「我实现了 Claude Code 的三层上下文管理」 ≫ 「我发明了一套压缩方案」
+3. **增量实施友好**：三层可以一层一层做。第一版只做 Tier 1 + Tier 2 就已经比 90% 的 agent 项目强
+4. **(d) 方案的精华没浪费**：方案 (d) 纯工具类型分类的智慧融入了 Tier 2 的"安全名单"——对少数协议级别绝对保护的工具（`ask_user`、非幂等命令）用硬规则兜底，其余交给 LLM
+
+#### 面试金句（本节沉淀）
+
+- 「上下文压缩不是压缩算法问题，是记忆管理问题。好的压缩策略反映你对 agent 未来会做什么的预测。」
+- 「扩大 context window 没解决问题，只是把崩溃变成了又贵又笨。」
+- 「Lost in the middle 不是 attention 的 bug，是训练数据的先验：模型学到了首尾重要、中间填充。」
+- 「如果允许孤儿 tool_result，LLM 会幻觉出不存在的工具调用上下文——这对 agent 是灾难，因为每一步都依赖前一步的真实结果。」
+- 「上下文压缩的核心难题是预测每条信息的未来重要性。因为无法精确预测，所有策略都是对这个概率的启发式估计。滑动窗口赌'近期更重要'，纯摘要赌'细节都不重要'，Claude Code 则把预测问题外包给 LLM 本身——让模型自己判断该保留什么。」
+- 「我用的是 Claude Code 的三层架构（Tier 1 本地去重 → Tier 2 LLM 摘要 → Tier 3 极端兜底）。核心哲学是：不同强度的压缩对应不同成本，先便宜后贵。大部分会话停在 Tier 1 就够了，根本不用花钱调摘要 LLM。」
+- 「为什么双阈值？单阈值会强制所有会话都付 LLM 摘要的钱，即使大部分会话靠本地去重就能解决。60% 触发 Tier 1 让'便宜路径'尽可能长，87% 触发 Tier 2 只在必要时才付语义费。」
+- 「熔断机制是 production 和 demo 的分界线。摘要 LLM 会失败——超时、空响应、API 错误。连续 3 次失败就熔断 Tier 2 回退到 Tier 1 + 用户提示，这是最低限度的故障处理。没有熔断的 agent 是玩具。」
+- 「Tier 2 内部用'LLM 摘要 + 近窗保留 + 安全名单'，用 LLM 语义理解处理 99% 的压缩判断，用硬规则兜底协议级不变量（ask_user 的 tool_result 绝对保留、非幂等命令绝对保留）。这是动态判断 + 静态兜底的组合。」
+- 「Tier 3-Lite 的核心是**用结构化约束换极端压缩率**。我让摘要 LLM 按严格的 3 节 JSON schema（task/files_touched/decisions）输出，同时删除所有 assistant_progress 消息——这些是 CoT 脚手架，对未来的 agent 几乎无用。这是对 Claude Code 九节版本的简化，但保留核心思想。」
+- 「Chain-of-Thought 的本质是用 token 数换算力——让模型消耗 token 去生成推理，每个推理 token 都是一次额外的前向传播。在 MiniCode 里 CoT 就是 `assistant_progress` 消息，是'内心独白'。Tier 3 删除它是因为：CoT 对当时的 agent 重要（指导下一步），但对未来的 agent 无用（工具结果和最终结论已经在别处）。」
+- 「阈值 60% / 87% / 95% 不是数学推导的最优值，是 Claude Code 源码泄露后看到的经验常量。Anthropic 有数百万真实会话数据去调优，我没有，所以直接抄并让它们可配置——未来有自己的数据再校准。」
+- 「摘要模型的 context window 必须 ≥ 主模型。否则会出现鸡生蛋问题：要摘要的内容塞不进摘要模型自己。默认用同家族的小模型（Haiku/Flash/mini），找不到就回退到主模型自己做摘要。」
+
+#### Tier 1 清理规则具体算法
+
+Tier 1 原本计划 3 条规则，讨论后**合并成 2 条统一规则**（最终形态）。
+
+##### 规则合并：从 3 条到 2 条
+
+**原本的 3 条**：
+1. 同文件去重（`read_file`）
+2. 删失败重试
+3. 折叠冗余工具输出（`list_files` / `grep_files`）
+
+**观察**：规则 1 和规则 3 其实是同一个模板——**幂等只读工具按 `(toolName, 规范化参数)` 分组，只留最新**。只是白名单工具不同。
+
+**合并后**：
+
+| 合并后 | 做什么 |
+|---|---|
+| **规则 A：幂等只读工具去重** | `read_file / list_files / grep_files / ...` 按 `(tool, args)` 分组，只留最新 |
+| **规则 B：删连续相同失败** | 连续的 + 同工具 + 同参数 + 同错误的失败 → 只留最后一个 |
+
+**为什么合并是正确的**：两条规则本来就用同一套数据结构（Map 分组 + 索引比较），只是工具白名单不同。合并后：
+- 代码行数少一半
+- 加新幂等工具只需改白名单配置，不需要写新规则
+- 消除了"read_file 规则" vs "list_files 规则"的人为区分
+
+##### 前置条件（隐藏 invariant）
+
+Tier 1 所有规则依赖一个**隐藏前提**：
+
+> **`messages` 数组必须按时间顺序排列（索引越大 = 时间越晚 = 越新）。**
+
+MiniCode 的 `agent-loop.ts` 只 `append` 不重排，这个前提天然成立。但任何依赖数组顺序的算法都应该在 spec 里**显式写下来**——否则将来有人改了上游行为，算法会安静地失效。
+
+**面试金句**：
+> 「依赖数组顺序的算法必须显式声明这个前提。'隐藏 invariant' 是 legacy code 坏掉的最常见原因——代码看起来工作正常，直到有人改了上游的某个细节，然后一切都坏了但错误信息指向了另一个地方。」
+
+##### 规则 A：幂等只读工具去重
+
+**白名单**（在 `context-compactor.ts` 顶部配置）：
+
+```typescript
+const IDEMPOTENT_READ_ONLY_TOOLS = new Set([
+  'read_file',
+  'list_files',
+  'grep_files',
+  'glob_files',
+  'count_lines',
+  // 新工具：在这里加一行就行
+])
+```
+
+**算法**（O(N) 线性扫描）：
+
+```typescript
+function dedupeIdempotentReads(
+  messages: ChatMessage[],
+): ChatMessage[] {
+  // 1. 扫一遍，为每个 (tool, args) 组记录最大索引
+  const lastIndexByKey = new Map<string, number>()
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    if (
+      msg.role === 'assistant_tool_call' &&
+      IDEMPOTENT_READ_ONLY_TOOLS.has(msg.toolName)
+    ) {
+      const key = groupKey(msg)
+      lastIndexByKey.set(key, i)   // 覆盖式写入，最后一次写入留下的就是最大索引
+    }
+  }
+
+  // 2. 收集所有"非最新"的 tool_call 索引及其配对 tool_result
+  const toDelete = new Set<number>()
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    if (
+      msg.role === 'assistant_tool_call' &&
+      IDEMPOTENT_READ_ONLY_TOOLS.has(msg.toolName)
+    ) {
+      const key = groupKey(msg)
+      if (lastIndexByKey.get(key) !== i) {
+        toDelete.add(i)
+        const trIdx = findMatchingToolResult(messages, i, msg.toolUseId)
+        if (trIdx !== -1) toDelete.add(trIdx)
+      }
+    }
+  }
+
+  return messages.filter((_, i) => !toDelete.has(i))
+}
+
+function groupKey(msg: AssistantToolCall): string {
+  // 关键：规范化 input
+  //   - path 字段必须 path.resolve(cwd, p)
+  //   - 其他字段 JSON.stringify 作为签名
+  const normalized = normalizeInput(msg.toolName, msg.input)
+  return `${msg.toolName}:${JSON.stringify(normalized)}`
+}
+```
+
+**关键实施点**：
+1. **规范化路径必须用调用时的 cwd**（记录在 `tool_result` 生成时），不能用事后的 cwd——否则历史 `cd` 过的对话会算错
+2. **`Map.set()` 天然覆盖**：扫描时每次遇到同 key 就覆盖，循环结束后留下的就是最大索引。不需要排序，不需要比较
+3. **配对保护**：删 `tc` 的同时必须删对应的 `tr`，遵守铁律 #1
+
+**为什么不用内容 hash 作为分组 key**：
+- hash 会把"文件被修改"误判成"这是两个不同的文件"→ 不去重
+- 我们的语义是「同一个文件的多次读，留最新」——**文件被修改恰恰是我们要检测的信号**（新版本应该覆盖旧版本）
+- 分组单位是**文件的身份**（路径），不是**内容的身份**（hash）
+
+##### 规则 B：删连续相同失败
+
+**触发条件**（五个必须同时成立）：
+
+```
+删 [tc_j, tr_j] 当且仅当：
+  1. tr_j.isError === true
+  2. 存在紧邻的前一对 [tc_{j-2}, tr_{j-2}]，且：
+     a. 中间没有其他 tc/tr 配对（"紧邻"）
+     b. tc_{j-2}.toolName === tc_j.toolName
+     c. JSON.stringify(tc_{j-2}.input) === JSON.stringify(tc_j.input)
+     d. tr_{j-2}.isError === true
+     e. tr_{j-2}.content === tr_j.content
+```
+
+**"紧邻"的重要性**：意味着 agent 在**连续重试同一个操作**。如果中间隔了其他操作（比如 agent 试了 A → 试了 B → 再试 A），后面那次可能是"环境变了再试一次"，保留原文是有价值的——所以只删真正相邻的重复。
+
+**伪代码**：
+
+```typescript
+function deleteConsecutiveDuplicateFailures(
+  messages: ChatMessage[],
+): ChatMessage[] {
+  const toDelete = new Set<number>()
+
+  // 找所有 [tc, tr] 配对的索引
+  const pairs: Array<{ tcIdx: number; trIdx: number }> = []
+  for (let i = 0; i < messages.length - 1; i++) {
+    if (
+      messages[i].role === 'assistant_tool_call' &&
+      messages[i + 1].role === 'tool_result'
+    ) {
+      pairs.push({ tcIdx: i, trIdx: i + 1 })
+    }
+  }
+
+  // 扫相邻的两对
+  for (let p = 1; p < pairs.length; p++) {
+    const prev = pairs[p - 1]
+    const curr = pairs[p]
+
+    // 必须真的紧邻（中间无其他 tc/tr）
+    if (curr.tcIdx !== prev.trIdx + 1) continue
+
+    const prevTc = messages[prev.tcIdx] as AssistantToolCall
+    const prevTr = messages[prev.trIdx] as ToolResult
+    const currTc = messages[curr.tcIdx] as AssistantToolCall
+    const currTr = messages[curr.trIdx] as ToolResult
+
+    if (
+      prevTr.isError &&
+      currTr.isError &&
+      prevTc.toolName === currTc.toolName &&
+      JSON.stringify(prevTc.input) === JSON.stringify(currTc.input) &&
+      prevTr.content === currTr.content
+    ) {
+      toDelete.add(curr.tcIdx)
+      toDelete.add(curr.trIdx)
+    }
+  }
+
+  return messages.filter((_, i) => !toDelete.has(i))
+}
+```
+
+##### 为什么规则 B 故意保守
+
+一个常见的更激进方案：「既然后面有成功调用，就把前面所有失败都删掉」。**这是错的**：
+
+1. **信息丢失**：失败路径是推理链的证据。用户问"你为什么改用这个参数"时，agent 需要失败历史才能回答
+2. **定义模糊**：需要定义"什么叫'后面有相似的成功'"——模糊匹配 + O(N²)
+3. **越界**：语义级的判断（"这些失败是同一次 debug 过程，可以总结"）应该交给 **Tier 2 的 LLM**，不是 Tier 1 的硬规则
+
+**Tier 1 的职责**是「零语义风险的机械去重」——只删"任何人一眼就看出来是重复"的消息。剩下的语义级压缩留给 Tier 2。这是**零成本机械层 vs 有成本语义层**的分工。
+
+##### 两条规则的执行顺序
+
+```
+messages
+  ↓
+规则 A：幂等只读去重
+  ↓
+规则 B：连续失败去重
+  ↓
+（可选）再跑一次 assertWellFormed 校验（防御式）
+  ↓
+Tier 1 清理后的 messages
+```
+
+**为什么 A 先 B 后**：规则 A 可能会删掉一些 `read_file` 配对。如果某个连续失败恰好夹在被删的 `read_file` 配对之间，规则 B 的"紧邻"判断需要基于**删完 A 之后的序列**。先 A 后 B 保证"紧邻"是相对于最终序列的。
+
+##### 面试金句
+
+- 「Tier 1 的 3 条原始规则被合并成 2 条——发现'read_file 去重'和'list_files 去重'是同一个模板的两个实例，用统一的"幂等只读工具白名单 + (tool, args) 分组 + 保留最新"解决，代码行数少一半。这是**重复的早期识别 + 抽象**——发现两个'看起来不同'的需求其实是同一个模式，立刻合并。」
+- 「Tier 1 故意保守——只删'任何人一眼就看出来是重复'的消息。语义级判断（比如'这段失败路径是 debug 循环，可以总结'）留给 Tier 2 的 LLM。这是**零成本机械层 vs 有成本语义层**的明确分工。」
+- 「`messages` 数组的时间顺序是 Tier 1 所有规则的隐藏 invariant。任何依赖数组顺序的算法都应该显式声明这个前提——'隐藏 invariant' 是 legacy code 坏掉的最常见原因。」
+
+#### 配对保护算法（Pair Guard）
+
+Tier 2 / Tier 3-Lite 按 token 预算切分 `messages`，**切点位置是被 token 数学强算出来的**，不是我们主动挑的。这个被强算出来的 `desiredIdx` 经常会落在 `assistant_tool_call` / `tool_result` 配对中间——因为每条消息的 token 数很不均匀（一条 `tool_result` 可能几千 token，一条 `user` 只有 5 token）。
+
+如果直接在 `desiredIdx` 切，就会违反铁律 #1（配对约束），两边都会出现孤儿消息，API 立刻拒收。
+
+**算法的职责**：给定一个被 token 预算算出来的粗糙 `desiredIdx`，**调整**它到最近的合法位置（`safeIdx`），保证两边配对完整。
+
+##### 核心规则
+
+```
+if role === 'assistant_tool_call'  →  pending.add(toolUseId)     ← 开一个"未完成配对"
+if role === 'tool_result'          →  pending.delete(toolUseId)  ← 关闭对应的配对
+其他 role（system/user/assistant/...）                            ← 不动 pending
+```
+
+**`pending.size === 0` 的位置 = 安全切点**，意思是"此前所有 `tool_call` 都已经配齐 `tool_result`，没有孤儿"。
+
+##### 停车场类比
+
+- `assistant_tool_call` = 一辆车**开进停车场**（+1）
+- `tool_result` = 对应那辆车**开出停车场**（-1）
+- `system / user / assistant / assistant_progress` = **路人**走过（不动）
+- **停车场里车数为 0 的时刻 = 安全切点**
+
+##### 方向选择：永远往前走
+
+```
+往前走（safeIdx < desiredIdx） → 摘要区变大，近窗变小 → ✅ 不会超预算
+往后走（safeIdx > desiredIdx） → 摘要区变小，近窗变大 → ❌ 可能爆预算
+```
+
+**规则**：**总是往前找最近的安全切点**（`safeIdx ≤ desiredIdx`）。这保证 token 预算是一个上界，不会被配对约束破坏。
+
+##### 伪代码（O(N) 线性扫描）
+
+```typescript
+function findSafeCutPoint(
+  messages: ChatMessage[],
+  desiredIdx: number,
+): number {
+  const pending = new Set<string>()  // 未配对的 tool_use id
+  let lastSafe = 0                   // 最后一个已知的安全切点
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+
+    if (msg.role === 'assistant_tool_call') {
+      pending.add(msg.toolUseId)
+    } else if (msg.role === 'tool_result') {
+      pending.delete(msg.toolUseId)
+    }
+
+    // 当 pending 为空时，i+1 是一个安全切点
+    if (pending.size === 0) {
+      if (i + 1 <= desiredIdx) {
+        lastSafe = i + 1
+      } else {
+        break  // 已超过期望位置，不用继续扫
+      }
+    }
+  }
+
+  return lastSafe
+}
+```
+
+##### 走通三个例子
+
+**例 1：切点正好在配对之后**
+
+```
+索引:  0    1    2    3    4    5
+角色:  sys  usr  tc1  tr1  usr  asst
+期望:  desiredIdx = 4
+```
+
+| i | role | 动作 | pending | 为空？ | safe |
+|---|---|---|---|---|---|
+| 0 | sys | 不动 | `{}` | ✅ | 1 |
+| 1 | usr | 不动 | `{}` | ✅ | 2 |
+| 2 | tc1 | +1 | `{1}` | ❌ | - |
+| 3 | tr1 | -1 | `{}` | ✅ | 4 |
+| 4 | usr | 不动 | `{}` | ✅ | 5 > 4, 停 |
+
+**返回 4**。完美命中。
+
+**例 2：切点落在配对中间**
+
+```
+索引:  0    1    2    3    4    5
+角色:  sys  usr  tc1  tr1  usr  asst
+期望:  desiredIdx = 3（落在 tc1 和 tr1 中间）
+```
+
+| i | role | 动作 | pending | 为空？ | safe |
+|---|---|---|---|---|---|
+| 0 | sys | 不动 | `{}` | ✅ | 1 |
+| 1 | usr | 不动 | `{}` | ✅ | 2 |
+| 2 | tc1 | +1 | `{1}` | ❌ | - |
+| 3 | tr1 | -1 | `{}` | ✅ | 4 > 3, 停 |
+
+**返回 2**。算法主动退回到配对之前的最后一个安全点，整对 `[tc1, tr1]` 进近窗。
+
+**例 3：长工具链横跨期望位置**
+
+```
+索引:  0    1    2    3    4    5    6    7
+角色:  sys  usr  tc1  tc2  tr1  tr2  usr  asst
+期望:  desiredIdx = 4
+```
+
+| i | role | 动作 | pending | 为空？ | safe |
+|---|---|---|---|---|---|
+| 0 | sys | 不动 | `{}` | ✅ | 1 |
+| 1 | usr | 不动 | `{}` | ✅ | 2 |
+| 2 | tc1 | +1 | `{1}` | ❌ | - |
+| 3 | tc2 | +1 | `{1,2}` | ❌ | - |
+| 4 | tr1 | -1 | `{2}` | ❌ | - |
+| 5 | tr2 | -1 | `{}` | ✅ | 6 > 4, 停 |
+
+**返回 2**。整个工具链 `[tc1, tc2, tr1, tr2]` 是一个**不可分的"原子团"**——算法把它整组推进近窗。近窗略微超过预算，但这是配对约束的必要代价。
+
+##### 边界情况
+
+**如果 `desiredIdx` 之前完全没有安全点？**
+
+极端例子：从第 1 条就是一个超长工具链，没有"休息点"。算法返回 `lastSafe = 0` → **整段对话都进摘要区，近窗为空**。
+
+这是退化情况，但算法正确处理：**宁可整段摘要，也不出孤儿消息**。
+
+##### 🔒 前置条件：输入必须是良构的
+
+**算法只能保护已有的配对，不能凭空制造不存在的配对。**
+
+如果传入的 `messages` 本身就有孤儿（比如有一个 `tool_call` 但没有对应的 `tool_result`），算法也会返回一个 safe 值，但**孤儿仍然会保留在输出里**——因为算法没有能力发明一个不存在的 `tool_result`。
+
+**所以**：压缩器有一条前置条件（**precondition**）：
+
+> **`context-compactor.ts` 的输入必须是良构的 `messages`——所有 `tool_call` 都有对应的 `tool_result`。如果这个前提被破坏，问题应该在上游（`agent-loop.ts`）解决，不是压缩器的职责。**
+
+##### Defensive Mode：入口校验
+
+MiniCode 采用 **defensive mode**——压缩器入口显式校验良构性，发现孤儿立刻抛异常：
+
+```typescript
+function assertWellFormed(messages: ChatMessage[]): void {
+  const pending = new Set<string>()
+  for (const msg of messages) {
+    if (msg.role === 'assistant_tool_call') {
+      pending.add(msg.toolUseId)
+    } else if (msg.role === 'tool_result') {
+      if (!pending.has(msg.toolUseId)) {
+        throw new CompactorError(
+          `orphan tool_result: toolUseId=${msg.toolUseId}`,
+        )
+      }
+      pending.delete(msg.toolUseId)
+    }
+  }
+  if (pending.size > 0) {
+    throw new CompactorError(
+      `orphan tool_call(s): ${[...pending].join(', ')}`,
+    )
+  }
+}
+```
+
+**为什么 defensive mode 而不是 trust mode**：
+1. **早失败比晚失败好**：压缩器抛 `CompactorError: orphan tool_call detected` 比主模型返回晦涩的 HTTP 400 更容易调试
+2. **失败位置清晰**：立刻能定位到是上游哪里产生了孤儿
+3. **代价极小**：10 行校验代码，O(N) 时间
+
+##### 职责划分
+
+| 谁的责任 | 做什么 |
+|---|---|
+| **`agent-loop.ts`** | 保证每次 `assistant_tool_call` 后必定追加对应的 `tool_result`（哪怕工具失败也要 `isError: true` 的 result） |
+| **错误恢复路径**（`awaitUser` / thinking 中断 / 空响应） | 异常中断时也要保证不留下孤儿 |
+| **`context-compactor.ts`** | **假设输入良构**，只做压缩，不做修复。入口 assertWellFormed 抛异常而非默默修复 |
+
+这是 **separation of concerns** 的典型应用：每个模块专注自己的职责，不越界。
+
+##### 面试金句
+
+- 「配对保护算法的核心是线性扫描找最近的安全切点：维护一个待配对 tool_use 集合，每次集合变空就记录一个安全点，取期望切点之前的最后一个安全点。时间复杂度 O(N)，空间 O(配对数)。」
+- 「关键设计决定：永远往前走不往后走。因为往后走可能让近窗超预算，破坏整个压缩的目的。前向保证 token 预算是一个上界。」
+- 「配对保护算法只能保护已有的配对，不能凭空制造不存在的配对。压缩器的前置条件是输入 messages 良构——所有 tool_call 都有对应的 tool_result。如果上游产生了孤儿，压缩器应该立刻抛异常而不是偷偷放过，因为修复数据不是压缩器的职责。这是 separation of concerns 的典型应用。」
+
+#### 安全名单（非幂等命令识别）
+
+Tier 2 摘要时有一条硬规则：**某些 `tool_result` 永远保留原文，不进摘要**。其中最复杂的一类是**非幂等的 `run_command`**——因为 `run_command` 的参数是 shell 字符串，需要识别"哪些 shell 命令是非幂等的"。
+
+##### 核心原则：Fail Closed / Safe by Default
+
+> **"哪些命令算危险？"这个问题没法回答——清单无限长。反过来"哪些命令肯定安全？"答案很少——就十几个。所以我们列出那十几个"绝对安全"的，其他所有命令一律当危险。**
+
+**机场安检类比**：
+- ❌ **黑名单**（禁带刀枪炸药…）→ 清单永远列不完，明天出新武器就漏
+- ✅ **白名单**（只允许衣服书电脑…）→ 清单有限，未见过的默认拒绝
+
+**错判代价不对称**：
+- 安全 → 当危险（多留点 token）= **可以接受**
+- 危险 → 当安全（删掉 `rm -rf` 的记录）= **不可接受**
+
+宁可错留 100 条，不可错删 1 条危险的。
+
+##### 安全命令白名单（~20 条）
+
+```typescript
+const SAFE_COMMAND_PREFIXES = new Set([
+  // 文件读取（不改磁盘）
+  'ls', 'cat', 'head', 'tail', 'wc', 'file', 'stat',
+  'grep', 'egrep', 'fgrep', 'find', 'locate',
+
+  // 系统查询（不改状态）
+  'pwd', 'whoami', 'id', 'uname', 'hostname', 'date',
+  'which', 'whereis', 'type', 'echo', 'printenv', 'env',
+
+  // 其他纯读
+  'cksum', 'md5sum', 'sha256sum', 'diff',
+])
+```
+
+**故意不在白名单的常见命令**：
+
+| 命令 | 原因 |
+|---|---|
+| `git` | 子命令太多（push/rm/checkout 有副作用），整体不白名单 |
+| `npm` / `pip` | 安装 = 副作用 |
+| `curl` / `wget` | 可能 POST，可能 `-o` 写文件 |
+| `sed` | `-i` 原地改文件 |
+| `awk` | `system()` 可执行任意命令 |
+| `docker` / `kubectl` | 各种子命令改状态 |
+
+**代价**：这些命令即使实际是"读"（比如 `git status`），也会被保留在近窗里不进摘要。**可接受**——假阳性（多留）比假阴性（误删）安全得多。
+
+##### 判断逻辑（~15 行代码）
+
+```typescript
+function isSafeCommand(cmd: string): boolean {
+  const trimmed = cmd.trim()
+
+  // 1. 禁止任何 shell meta-character
+  //    有管道/重定向/命令链 → 一律视为不安全
+  if (/[|&;<>$`(){}]/.test(trimmed)) return false
+
+  // 2. 取第一个 token 作为命令名
+  const firstToken = trimmed.split(/\s+/)[0]
+
+  // 3. 查白名单
+  return SAFE_COMMAND_PREFIXES.has(firstToken)
+}
+
+function isNonIdempotentRunCommand(tc: AssistantToolCall): boolean {
+  if (tc.toolName !== 'run_command') return false
+  const cmd = (tc.input as { command?: string }).command ?? ''
+  return !isSafeCommand(cmd)
+}
+```
+
+**关键设计点**：
+
+1. **Meta-character 检查在白名单之前**：任何包含 `| & ; < > $ \` ( ) { }` 的命令直接拒绝。这些符号意味着"多命令组合 / 管道 / 子 shell / 重定向"，无法简单解析 → 拒绝比错误分析安全
+2. **只看第一个 token**：`ls -la src/` 的第一个 token 是 `ls`，参数不影响安全性
+3. **白名单必须小而准**：宁可漏掉一些"其实安全"的命令（如 `git status`），也不能错判危险命令
+4. **可配置**：白名单放在 config 里或通过环境变量覆盖，方便用户按自己的环境微调
+
+##### 反例验证
+
+```typescript
+isSafeCommand('ls -la')                    // true  ✅ 白名单 + 无 meta char
+isSafeCommand('cat /etc/hosts')            // true  ✅
+isSafeCommand('grep "TODO" src/')          // true  ✅
+isSafeCommand('echo hello')                // true  ✅
+
+isSafeCommand('rm -rf /')                  // false ✅ 不在白名单
+isSafeCommand('git push')                  // false ✅ 不在白名单
+isSafeCommand('npm install')               // false ✅ 不在白名单
+
+isSafeCommand('echo "rm -rf /" > file.txt') // false ✅ 有 '>' 被 meta 检查拦截
+isSafeCommand('ls | grep foo')             // false ✅ 有 '|'
+isSafeCommand('ls && rm foo')              // false ✅ 有 '&&'
+isSafeCommand('ls $(cat cmd)')             // false ✅ 有 '$(' 和 '('
+```
+
+**注意反例 `echo "rm -rf /" > file.txt`**：虽然 `echo` 在白名单里，但重定向 `>` 让它变成了"写文件"操作——meta-character 检查在白名单之前拦截，正确识别为危险。
+
+##### 面试金句
+
+- 「安全分类用白名单而非黑名单，因为**安全命令是有限集合，危险命令是无限集合**。枚举有限集合可行，枚举无限集合不可行。这是 **fail closed / safe by default** 原则——不确定就当危险。」
+- 「任何包含 shell meta-character 的命令（`|`、`&`、`;`、`>`、`$`、反引号等）直接当不安全——因为我们没法简单解析多命令组合，拒绝分析比错误分析安全。」
+- 「MiniCode 的安全列表只有 ~20 条，小且准。代价是 `git status` 这种'其实安全'的命令也会被过度保留——但假阳性比假阴性安全得多。这是**错判代价不对称**下的典型工程权衡：宁可错留 100 条，不可错删 1 条危险的。」
+
+#### 摘要 Prompt 设计
+
+Tier 2 和 Tier 3-Lite 都需要一个摘要 LLM 调用，本节给出两个 prompt 的完整模板以及设计原则。
+
+##### 设计原则（6 条，通用于所有摘要 prompt）
+
+**1. Principles, not Enumeration（原则式，而非枚举式）**
+
+不要列"保留这条、保留那条"——那样 prompt 会变得和对话一样长。要给 LLM 一套**信息分级原则**，让它自己判断。
+
+> **Enumeration Trap**：新手最常见的错误是想把"该留什么"写清楚，结果越写越长。正确做法是给 LLM 类别（HIGH/MEDIUM/LOW），让它把具体消息对号入座。这让 prompt 复杂度从 O(N) 降到 O(1)。
+
+**2. Role + Goal 先行**
+
+prompt 第一句必须回答两个问题：**"你是谁？你的输出给谁看？"**
+
+摘要 prompt 的答案是："你是压缩器，输出给**同一个 agent 的未来版本**看。"——这改变 LLM 的写作风格（不用对人类礼貌，可以简洁直接）。
+
+**3. 负面约束（明确告诉"可以丢什么"）**
+
+人类写摘要时会"什么都想留一点"，LLM 也一样。所以要**明确列出可以丢的东西**——比这更有效的是"这些不要在输出里出现"这种否定式指令。
+
+**4. 情境暗示紧急程度**
+
+越激进的压缩，越要在 prompt 开头**明说"这是紧急状态"**。比如 Tier 3-Lite 开头说「invoked only when >95%, last line of defense」——这让 LLM 内部的 prior 偏向更激进的档位。
+
+**5. 结构化输出的三层防御**
+
+当需要 JSON 输出时，**不能只靠 prompt**。需要三层防御：
+- 第一层：prompt 严格约束（"ONLY JSON, no markdown, no preamble"）
+- 第二层：代码 `try/catch JSON.parse`
+- 第三层：解析失败时熔断回退（触发降级流程），不让整个会话崩
+
+**6. 反幻觉明确写出**
+
+压缩任务下 LLM 特别容易编造，因为"精炼"的压力会让它给出漂亮但不准确的总结。**必须明确写** "Do not invent. Prefer omission over speculation."
+
+##### Tier 2 Prompt 模板
+
+```
+You are a context compressor for an AI coding agent. Your job is to
+compress a conversation history into a concise summary that the SAME
+agent will use to continue the SAME task. The summary replaces the
+original messages in the agent's context window.
+
+## Priority (keep these)
+
+HIGH — must preserve:
+- The user's original task and any refinements
+- Unresolved errors or blockers
+- User preferences or constraints explicitly stated
+- Decisions made with their reasoning
+- Files that were modified (paths only, not contents)
+- Unfinished sub-tasks
+
+MEDIUM — summarize compactly:
+- Tools used and their purposes (e.g., "read config files",
+  not the full file contents)
+- Paths of files inspected
+- High-level progress through the task
+
+LOW — drop entirely:
+- Full contents of files (agent can re-read if needed)
+- Individual error messages that were later resolved
+- Reasoning/thinking between tool calls
+- Repeated tool outputs
+- Intermediate status messages
+
+## Constraints
+
+- Target length: ~10% of the original input length
+- Write in second person ("you did X") — this is a note to
+  the continuing agent, not to a human
+- Be specific about file paths and function names — these are
+  the hooks the agent uses to resume
+- Do NOT wrap in markdown code blocks
+- Do NOT add commentary like "Here is the summary:"
+- Output the summary text directly
+
+## Input
+
+The conversation history follows below this line:
+---
+{MESSAGES_SERIALIZED_AS_TEXT}
+```
+
+##### Tier 3-Lite Prompt 模板
+
+```
+You are an EXTREME context compressor for an AI coding agent.
+You are invoked only when the conversation has become critically
+long (>95% of the context window) and lightweight compression is
+not enough. Your job is to extract the absolute minimum information
+needed for the same agent to resume the same task.
+
+Your output replaces the original conversation history. Assume
+EVERY token matters — this is the last line of defense before
+the agent hits a hard context limit.
+
+## Output format (STRICT)
+
+Return ONLY a valid JSON object matching EXACTLY this schema.
+No markdown code fences. No explanations. No preamble. Just JSON.
+
+{
+  "task": "<one sentence describing what the agent is trying to accomplish>",
+  "files_touched": ["<absolute or workspace-relative path>", ...],
+  "decisions": ["<concise decision or constraint>", ...]
+}
+
+## What to put in each field
+
+task:
+- Exactly ONE sentence
+- Present tense, second person ("You are refactoring X to support Y")
+- Captures the ORIGINAL user goal plus any refinements
+- Do NOT describe progress or status — only the goal
+- Max 30 words
+
+files_touched:
+- File paths that have been READ or MODIFIED
+- Deduplicate automatically
+- Max 20 entries — if more, keep the most recently touched
+
+decisions:
+- Concrete commitments the agent or user has already made
+- Each ≤ 20 words
+- Max 10 entries — keep the most load-bearing ones
+- Do NOT include speculative ideas that were rejected
+- Do NOT include tool outputs or file contents
+
+## Hard rules
+
+- Output ONLY the JSON object. No commentary, no markdown.
+- If a field has no content, use empty string "" or empty array []
+  — never null, never omit the field.
+- Every string must be valid JSON (escape quotes, no unescaped newlines).
+- Do not invent information not present in the input.
+- Prefer omission over speculation.
+
+## Input
+
+The conversation history (already with assistant_progress messages
+removed) follows below:
+---
+{MESSAGES_SERIALIZED_AS_TEXT}
+```
+
+##### 输入/输出示例对比
+
+**示例输入**（简化的会话，实际 ~7000 tokens）：
+
+```
+[0]  system:              "You are MiniCode..."
+[1]  user:                "帮我加一个 /save 命令导出对话为 markdown"
+[2]  assistant:           "我先看现有命令"
+[3]  assistant_tool_call: read_file('src/cli-commands.ts')
+[4]  tool_result:         (120 行代码)
+[5]  assistant_progress:  "看看 /cost 的模式作为参考..."
+[6]  assistant_tool_call: read_file('src/usage-tracker.ts')
+[7]  tool_result:         (200 行代码)
+[8]  assistant_tool_call: read_file('src/types.ts')
+[9]  tool_result:         (80 行代码)
+[10] assistant:           "我会新建 src/export.ts ..."
+[11] assistant_tool_call: write_file('src/export.ts', ...)
+[12] tool_result:         ok
+[13] assistant_tool_call: edit_file('src/cli-commands.ts', ...)
+[14] tool_result:         "Cannot find registerCommand" isError=true
+[15] assistant_tool_call: edit_file('src/cli-commands.ts', ...)
+[16] tool_result:         ok
+[17] assistant:            "完成了"
+[18] user:                 "现在把 tool calls 也作为代码块导出"
+```
+
+**Tier 2 的输出**（自由文本，~150 tokens，压缩到 ~2%）：
+
+```
+Previous conversation summary:
+
+You are implementing a `/save` slash command in MiniCode that exports
+the current chat history as markdown. You studied `src/cli-commands.ts`
+and `src/usage-tracker.ts` as reference patterns (the latter for the
+`/cost` command structure). You then created `src/export.ts` as a new
+module for serialization logic, and registered the `/save` handler in
+`src/cli-commands.ts`. The first edit to cli-commands.ts failed
+(wrong function name for registration), but the corrected second
+attempt succeeded. The `/save` command is now functional.
+
+The user's next request, not yet started: extend the export so that
+tool_call messages are rendered as fenced code blocks in the output
+markdown.
+
+Files touched: src/export.ts (new), src/cli-commands.ts (modified),
+src/usage-tracker.ts (reference), src/types.ts (reference).
+```
+
+**Tier 3-Lite 的输出**（严格 JSON，~80 tokens，压缩到 ~1%）：
+
+```json
+{
+  "task": "You are adding a /save command to MiniCode that exports chat history as markdown; currently extending it to render tool_call messages as fenced code blocks.",
+  "files_touched": [
+    "src/export.ts",
+    "src/cli-commands.ts",
+    "src/usage-tracker.ts",
+    "src/types.ts"
+  ],
+  "decisions": [
+    "Created src/export.ts as a new module for serialization logic",
+    "Modeled /save after /cost command's registration pattern",
+    "Export handler lives in cli-commands.ts alongside existing commands"
+  ]
+}
+```
+
+**注意 Tier 3-Lite 的 JSON 不直接塞进 messages**——它会被**渲染成可读文本块**再作为 user message 插入：
+
+```
+[
+  { role: 'system', content: '...' },
+  { role: 'user',   content: 'Previous conversation summary (structured):
+                               Task: You are adding a /save command...
+                               Files touched: src/export.ts, src/cli-commands.ts, ...
+                               Decisions:
+                                 - Created src/export.ts as a new module...
+                                 - Modeled /save after /cost command...
+                                 - Export handler lives in cli-commands.ts...' },
+  { role: 'user',   content: '现在把 tool calls 也作为代码块导出' }  // 近窗
+]
+```
+
+JSON 是**内部传输格式**（便于代码解析 + schema 验证），塞进 messages 时格式化成文本。
+
+##### 两种输出的关键差异
+
+| 维度 | Tier 2 输出 | Tier 3-Lite 输出 |
+|---|---|---|
+| 失败历史 | ✅ 保留（"first edit failed"） | ❌ 丢弃 |
+| 叙事性描述 | ✅ 有（"you then created"） | ❌ 只有结果 |
+| 近窗保留 | 20% of context | 10% of context |
+| 格式 | 自由文本 | 严格 JSON |
+| 压缩比 | ~2% | ~1% |
+| 解析风险 | 低（纯文本） | 中（JSON 可能被污染） |
+
+**一个有意设计**：Tier 3-Lite **故意丢弃失败历史**。代价是 agent 之后可能重复昨天的错误（再次写错函数名），但在 95% 紧急状态下这是合理权衡——**宁可重做一次，不能爆 context**。
+
+##### 面试金句
+
+- 「好的摘要 prompt 是 O(1) 的：无论对话多长，prompt 都这么长。避免 enumeration trap——不要枚举'保留这条、那条'，而是给 LLM 一套分级原则让它自己判断。这等价于把信息重要性估计外包给 LLM 本身。」
+- 「结构化输出（JSON）的 prompt 必须三层防御：prompt 严格约束 + 代码 try/catch + 熔断回退。只靠 prompt 约束会被污染，必须有代码兜底。」
+- 「Tier 3-Lite 的核心 prompt 设计 trick 是'情境暗示紧急程度'——开头明说 'invoked only when >95%, last line of defense'，让 LLM 内部的 prior 偏向更激进的压缩档位。相同的 prompt 体骨如果不说情境，LLM 会写得和 Tier 2 差不多长。」
+- 「Tier 3-Lite 故意丢弃失败历史，接受'agent 可能重犯错误'的代价。这是压缩的基本哲学：不同紧急程度接受不同的信息损失水平，而不是一个压缩策略适配所有情况。」
+
+#### 被压缩掉的原始消息怎么办（压缩视角下的审计 trail）
+
+**问题的真正范围**：当 Tier 2/3 做完摘要后，被丢掉的旧消息，**在当前运行中的会话里**要不要保留一份副本？
+
+**注意划清边界**：
+- ✅ 这个问题问的是「压缩副作用的影响范围」——发生在**单次会话运行时**
+- ❌ 这**不是**「会话关闭后怎么持久化 + 跨进程恢复」——那是另一个独立 feature，见 **§4.18 会话持久化**
+
+**选定方案：内存保留一份副本**
+
+在 `context-compactor.ts` 内部维护一个 `archivedMessages: ChatMessage[]` 数组：
+
+```
+每次 Tier 2 / Tier 3-Lite 执行时：
+  1. 识别被摘要掉的消息（旧区）
+  2. 把它们 append 到 archivedMessages
+  3. 运行时的 messages 数组替换成压缩后版本
+  4. archivedMessages 对 agent-loop 不可见（不会影响 LLM 调用）
+```
+
+**提供 `/restore --peek` 命令**：用户可以查看被压缩掉的原始消息，但**不会**把它们塞回 messages（纯只读审计）。
+
+**关键约束**：
+- `archivedMessages` **只在当前进程内存**——关闭进程就丢
+- 不写磁盘——写磁盘是 §4.18 的职责
+- 不影响 LLM 的 token 成本——只是内存里的一个 JavaScript 数组
+
+**为什么够用**：
+
+| 用户的真实需求 | 内存保留能满足吗？ |
+|---|---|
+| 当前会话中回头确认 LLM 没胡说 | ✅ 能（`/restore --peek`） |
+| 关机后第二天接着聊 | ❌ 不能（那是 §4.18） |
+| 审计 trail 用于 compliance | ❌ 不能（那是 §4.18） |
+
+**面试话术（压缩视角）**：
+
+> 「压缩时被丢掉的原始消息在内存里保留一份副本（`archivedMessages`）。这是会话内审计 trail——用户随时可以 `/restore --peek` 查看原文确认 LLM 没胡说。至于跨进程持久化，那是一个独立的会话持久化 feature（§4.18），不应该和压缩耦合。把两件事分开是**避免 scope creep 的典型工程权衡**。」
+
+**面试金句（scope 界限）**：
+
+- 「上下文压缩和会话持久化是两个独立 feature。压缩解决'怎么让当前会话变短'，持久化解决'怎么让关机后还能找回会话'。两者在时间维度上不同：压缩在运行时，持久化跨进程。混在一起会让任何一个都做不好。」
+
+#### 待决定的问题
+
+- [x] **压缩策略**：~~滑动窗口 / 全文摘要 / 摘要+近窗混合 / 向量检索~~ → **✅ 三层架构（Tier 1 本地清理 + Tier 2 LLM 摘要 + Tier 3-Lite 结构化简化版）**
+- [x] **触发时机**：~~手动 / 自动阈值 / 混合~~ → **✅ 双阈值自动（60% Tier 1 / 87% Tier 2 / 95% Tier 3-Lite）+ 手动 `/compact` 和 `/compact --deep`**
+- [x] **摘要模型选择**：~~Haiku / Flash / 主模型~~ → **✅ 默认同家族小模型（硬约束：context window ≥ 主模型），找不到回退主模型自己**
+- [x] **`context_summary` role 的具体结构**：Tier 2 用纯文本，**Tier 3-Lite 用结构化 JSON**（task / files_touched / decisions 三节）
+- [x] **占用率计算**：字符数估算（英文 `/4`、中文 `/2`、混合 `/3`），误差 ±10% 可接受
+- [x] **阈值可配置性**：通过环境变量 `MINI_CODE_COMPACT_*` 覆盖默认值
+- [x] **原始历史存储（压缩视角）**：~~不存 / 内存 / 文件 / 文件+`/restore`~~ → **✅ 内存保留 `archivedMessages[]` + `/restore --peek` 只读命令**。跨进程持久化转到 §4.18
+- [x] **配对保护的具体算法**：~~往前回退还是往后推进~~ → **✅ O(N) 线性扫描 + 永远往前走（`findSafeCutPoint`）+ defensive mode 入口校验（`assertWellFormed`）**
+- [x] **安全名单的完整定义**：~~正则 / 关键字 / LLM 判断~~ → **✅ Fail Closed / Safe by Default：~20 条安全命令白名单 + 任何 shell meta-character 直接判危险**。错判代价不对称——宁可错留 100 条，不可错删 1 条
+- [x] **摘要 prompt 设计**：~~具体给摘要模型什么 system prompt？~~ → **✅ 两个完整模板已写入**。设计原则：Principles not Enumeration（O(1) 长度）+ Role/Goal 先行 + 负面约束 + 情境暗示紧急程度 + 结构化输出三层防御 + 反幻觉明说。Tier 2 自由文本约 10%，Tier 3-Lite JSON 约 1%
+- [x] **Tier 1 清理规则的具体算法**：~~同文件去重 / 失败重试 / 折叠冗余~~ → **✅ 合并成 2 条规则：规则 A 幂等只读工具去重（规范化路径 + `Map.set()` 覆盖式选最新）+ 规则 B 删连续相同失败（5 条严格条件 + "紧邻"约束）**。隐藏 invariant：messages 必须按时间顺序
+
+#### 故意不做（intentionally skipped）
+
+对照 Claude Code Complete Guide Part 8 的学习目标清单，以下两项**在 MiniCode 项目中故意跳过**：
+
+- ⛔ **cache_edits 缓存感知压缩**：这是 Anthropic prompt caching 的延伸优化。MiniCode 当前**没启用 prompt caching**，短期也不会（见"第一版不做"列表）。纯理论学习当前没有 application，等真正启用 prompt caching 时再补
+- ⛔ **API 层 compaction（`compact-2026-01-12` 头）vs 交互层 `/compact`**：`compact-2026-01-12` 是 Anthropic **服务端**能力。MiniCode 是客户端，而且**整个项目的学习目的就是"自己实现三层 compact"**——用服务端能力会偏离项目目标。如果面试被问到，可以说"我知道有这个服务端 header，但 MiniCode 选择客户端实现路线以深化架构理解"
+
+这两条写在这里是**防止将来回来问"为什么没做"**——显式的"不做"比"漏了"更清晰。
+
+后续 Socratic 对话会逐个回答这些问题。
+
+---
+
+### 4.18 会话持久化（session-archive.ts — 未来规划）
+
+**状态**：🚧 未来 feature，尚未进入 Socratic 完整对话阶段。本节收录从 Claude Code 源码分析中学到的参考架构，作为未来讨论的起点。
+
+#### 一句话定位
+
+> **把整个会话的消息历史、元数据、压缩快照持久化到磁盘，支持跨进程恢复和审计。**
+
+#### 与 §4.17 上下文压缩的关系
+
+这是两个**独立且互补**的 feature：
+
+| 维度 | §4.17 上下文压缩 | §4.18 会话持久化 |
+|---|---|---|
+| **解决的问题** | 运行时怎么让 `messages` 变短 | 关机后怎么保存和恢复整个会话 |
+| **时间维度** | 单次会话运行时 | 跨进程 / 跨会话 |
+| **输出** | 压缩后的运行时 `messages` | 磁盘上的会话目录 |
+| **是否影响 token 成本** | ✅ 影响（核心目的） | ❌ 不影响（纯 I/O） |
+
+**两者的耦合点**：
+- §4.17 产生 `archivedMessages`（压缩时被丢掉的原文），§4.18 可以**选择性消费**这个数据
+- §4.18 的持久化**应该包含未压缩原文**（transcript）**和**压缩后快照（checkpoint）
+- 但 §4.17 不依赖 §4.18——可以单独实现
+
+#### Claude Code 的真实架构（参考）
+
+2025 年 Claude Code 部分源码泄露后，社区整理出的持久化架构：
+
+```
+~/.claude/projects/
+  └── <project-hash>/              ← 每个项目一个目录，hash 来自 cwd
+      └── sessions/
+          └── <session-id>/        ← 每个会话一个子目录（UUID）
+              ├── transcript.jsonl    ← 消息流，append-only
+              ├── checkpoints/
+              │   ├── cp-0001.json       ← Tier 2/3 后的压缩快照
+              │   ├── cp-0002.json
+              │   └── ...
+              └── meta.json           ← 会话元数据
+```
+
+**三个文件的职责**：
+
+**1. `transcript.jsonl`**（消息流，append-only）
+
+```
+每一行是一个 TranscriptLine：
+  - timestamp
+  - role: user | assistant | tool | system
+  - payload（消息内容）
+```
+
+**关键特性**：
+- **Append-only**：永不修改历史，只追加新行
+- **JSONL 而非 JSON**：坏一行不影响其他行（支持 truncate-repair）
+- **一行一事件**：grep 友好
+
+**2. `checkpoints/cp-XXXX.json`**（压缩快照）
+
+```
+每个 checkpoint 包含：
+  - atMessageIndex    ← 在 transcript 的哪一行开始
+  - summary           ← 摘要文本
+  - artifactRefs      ← 对大载荷的引用（而不是内嵌）
+```
+
+**关键洞察**：Claude Code **不是"原文和摘要二选一"**，而是**两个都存**：
+- `transcript.jsonl` 保留所有原始消息（审计用）
+- `checkpoints/` 保留每次压缩后的版本（运行时加载用）
+- 运行时用 checkpoint（省 token），审计时看 transcript（看原文）
+
+**3. `meta.json`**（会话元数据）
+
+```
+  - sessionId
+  - projectPath       ← 对应哪个项目
+  - cwd               ← 启动时的工作目录
+  - cliVersion        ← 用的 CLI 版本（未来做版本迁移）
+  - timestamps
+  - parentSessionId   ← 如果这个会话是从另一个 fork 出来的
+```
+
+#### `claude -c` 的 resume 机制
+
+```
+findLatestResumableSession()
+  ↓
+按 updatedAt 排序 → 选最新的
+  ↓
+isSessionHealthy() 健康检查：
+  - meta.json 可读
+  - transcript JSON 完整（坏了就 truncate-repair）
+  - checkpoint 索引一致
+  - 磁盘可写
+  ↓
+失败 → 降级而非阻塞
+```
+
+**`truncate-repair`**：即便 transcript 损坏（比如进程被 kill 在写入一半），也能**从损坏行往前截断恢复**，不让用户的历史全丢。这是 JSONL 相对 JSON 的决定性优势。
+
+#### 并发锁
+
+**`.lock` 文件 + 进程级 advisory lock**，防止两个 CLI 实例同时写同一个 transcript.jsonl。
+
+#### 清理策略
+
+**Claude Code 文档明确说：不自动清理**。
+
+理由（推测）：
+1. JSONL 文件很小（一个 50k token 的会话 ≈ 200 KB）
+2. 自动清理有"误删"风险
+3. 用户手动 `rm -rf` 更安全
+
+#### 高级特性：`parentSessionId` 会话 fork
+
+Claude Code 支持**会话 fork**——从任意历史会话岔一条新分支，类似 git branch。实现方式：在 `meta.json` 里记录 `parentSessionId`。
+
+#### MiniCode 的简化方案（未来 Socratic 对话时细化）
+
+**第一版做**：
+- ✅ `~/.mini-code/projects/<project-hash>/sessions/<session-id>/` 目录结构
+- ✅ `transcript.jsonl` append-only
+- ✅ `meta.json`（简化版）
+- ✅ `/restore --last` 和 `/restore <id>`（基础版，不带健康检查）
+- ✅ 不自动清理（对齐 Claude Code）
+
+**第一版不做（仅文档化）**：
+- ❌ `checkpoints/` 目录（第一版只有 transcript 原文）
+- ❌ Truncate-repair（崩了就让用户手动修）
+- ❌ `parentSessionId` fork
+- ❌ `.lock` 并发锁（单实例使用不会撞）
+
+#### 待决定的问题（留给未来 Socratic 对话）
+
+- [ ] **写入时机**：每条消息立刻 append，还是批量 flush？
+- [ ] **project hash 算法**：SHA-256(cwd) 前 8 位？完整路径 base64？
+- [ ] **session ID 生成**：UUID v4，还是时间戳 + 随机后缀？
+- [ ] **meta.json 最小字段**：MVP 要存哪些字段？
+- [ ] **`/restore` UX**：列表怎么显示？按时间倒序 / 按项目分组？
+- [ ] **压缩快照（checkpoints）第一版要不要做**：不做的话，restore 后还要重新压缩
+- [ ] **transcript 格式向前兼容**：未来字段变了怎么处理？
+- [ ] **会话元数据索引**：要不要建一个 `~/.mini-code/sessions-index.json` 方便快速列出？
+
+#### 面试金句
+
+- 「会话持久化的核心设计是'双文件架构'：transcript.jsonl 保留原始消息作为审计 trail，checkpoints 存压缩快照作为运行时加载入口。两者互不覆盖——原文永远在，压缩是一个视图。」
+- 「选 JSONL 而不是 JSON 是因为 append-only 和损坏可恢复：JSONL 每行独立解析，一行坏了只截断一行，其余完整。这是 Docker log、Nginx access log 的同类选择。」
+- 「我没实现自动清理——和 Claude Code 一样。JSONL 文件很小，自动清理会引入误删风险，用户手动 `rm` 更安全。这是显式的工程权衡：把决定权留给用户。」
+
+---
+
 ## 5. 消息流转示例
 
 假设用户输入"读取 README.md"，完整的消息流转：
@@ -1381,6 +2936,8 @@ npm run install-local                    # 交互式安装
 | `/model <name>` | 持久化切换模型 |
 | `/config-paths` | 显示配置文件路径 |
 | `/permissions` | 显示权限存储路径 |
+| `/cost` | 显示当前 session 的 token 用量与估算成本 |
+| `/cost reset` | 重置 session token 计数器 |
 | `/exit` | 退出 |
 
 **工具快捷命令（直接调用工具，跳过 LLM）：**
